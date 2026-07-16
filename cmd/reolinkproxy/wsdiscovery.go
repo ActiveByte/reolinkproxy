@@ -10,10 +10,13 @@ import (
 )
 
 type wsDiscoveryServer struct {
-	cfg onvifConfig
+	cfgs []onvifConfig
 }
 
-func startWSDiscovery(cfg onvifConfig) {
+// startWSDiscovery starts a single shared WS-Discovery UDP listener (port 3702 can only be
+// bound once) that answers each incoming Probe with one ProbeMatch per configured camera,
+// so every per-camera ONVIF service is independently discoverable.
+func startWSDiscovery(cfgs []onvifConfig) {
 	addr, err := net.ResolveUDPAddr("udp4", "239.255.255.250:3702")
 	if err != nil {
 		log.Printf("ws-discovery: resolve addr failed: %v", err)
@@ -26,7 +29,7 @@ func startWSDiscovery(cfg onvifConfig) {
 		return
 	}
 
-	s := &wsDiscoveryServer{cfg: cfg}
+	s := &wsDiscoveryServer{cfgs: cfgs}
 	go s.serve(conn)
 }
 
@@ -70,29 +73,36 @@ func (s *wsDiscoveryServer) handleMessage(conn *net.UDPConn, src *net.UDPAddr, m
 		return
 	}
 
-	response := s.buildProbeMatch(env.Header.MessageID)
-	_, err := conn.WriteToUDP([]byte(response), src)
-	if err != nil {
-		log.Printf("ws-discovery: write failed: %v", err)
+	// Reply once per configured camera so each is independently discoverable/adoptable.
+	for _, cfg := range s.cfgs {
+		response := buildProbeMatch(cfg, env.Header.MessageID)
+		if _, err := conn.WriteToUDP([]byte(response), src); err != nil {
+			log.Printf("ws-discovery: write failed: %v", err)
+		}
 	}
 }
 
-func (s *wsDiscoveryServer) buildProbeMatch(relatesTo string) string {
+func buildProbeMatch(cfg onvifConfig, relatesTo string) string {
 	messageID := "urn:uuid:" + uuid.New().String()
 
+	deviceUUID := cfg.DeviceUUID
+	if deviceUUID == "" {
+		deviceUUID = uuid.New().String()
+	}
+
 	// Format scopes
-	model := strings.ReplaceAll(strings.TrimSpace(s.cfg.Model), " ", "_")
-	name := strings.ReplaceAll(strings.TrimSpace(s.cfg.DeviceName), " ", "_")
+	model := strings.ReplaceAll(strings.TrimSpace(cfg.Model), " ", "_")
+	name := strings.ReplaceAll(strings.TrimSpace(cfg.DeviceName), " ", "_")
 	scopes := fmt.Sprintf("onvif://www.onvif.org/type/video_encoder onvif://www.onvif.org/hardware/%s onvif://www.onvif.org/name/%s onvif://www.onvif.org/Profile/Streaming onvif://www.onvif.org/Profile/S onvif://www.onvif.org/Profile/T", model, name)
 
 	var host string
-	if s.cfg.AdvertiseHost != "" && s.cfg.AdvertiseHost != "0.0.0.0" && s.cfg.AdvertiseHost != "::" {
-		host = s.cfg.AdvertiseHost
+	if cfg.AdvertiseHost != "" && cfg.AdvertiseHost != "0.0.0.0" && cfg.AdvertiseHost != "::" {
+		host = cfg.AdvertiseHost
 	} else {
 		host = getOutboundIP()
 	}
 
-	xaddr := buildURL("http", advertisedAuthority(s.cfg.Address, host), s.cfg.DevicePath)
+	xaddr := buildURL("http", advertisedAuthority(cfg.Address, host), cfg.DevicePath)
 
 	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <env:Envelope xmlns:env="http://www.w3.org/2003/05/soap-envelope" xmlns:wsa="http://schemas.xmlsoap.org/ws/2004/08/addressing" xmlns:d="http://schemas.xmlsoap.org/ws/2005/04/discovery" xmlns:dn="http://www.onvif.org/ver10/network/wsdl">
@@ -115,5 +125,5 @@ func (s *wsDiscoveryServer) buildProbeMatch(relatesTo string) string {
       </d:ProbeMatch>
     </d:ProbeMatches>
   </env:Body>
-</env:Envelope>`, messageID, xmlEscape(relatesTo), uuid.New().String(), xmlEscape(scopes), xmlEscape(xaddr))
+</env:Envelope>`, messageID, xmlEscape(relatesTo), deviceUUID, xmlEscape(scopes), xmlEscape(xaddr))
 }

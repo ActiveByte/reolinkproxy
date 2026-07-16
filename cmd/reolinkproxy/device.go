@@ -49,6 +49,14 @@ func (m *CameraDevice) Ensure(ctx context.Context) (*baichuan.Client, error) {
 	return client, nil
 }
 
+// Connected reports whether the camera currently has a live, error-free Baichuan session.
+// Used by the status web UI only - it doesn't establish a connection itself.
+func (m *CameraDevice) Connected() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.client != nil && m.client.Err() == nil
+}
+
 func (m *CameraDevice) WithClient(ctx context.Context, fn func(*baichuan.Client) error) error {
 	client, err := m.Ensure(ctx)
 	if err != nil {

@@ -13,9 +13,7 @@ func TestBuildProbeMatch(t *testing.T) {
 		DevicePath:    "/onvif/device_service",
 		AdvertiseHost: "127.0.0.1",
 	}
-	server := &wsDiscoveryServer{cfg: cfg}
-
-	response := server.buildProbeMatch("urn:uuid:test-relates-to")
+	response := buildProbeMatch(cfg, "urn:uuid:test-relates-to")
 
 	expectedSubstrings := []string{
 		"<env:Envelope",
