@@ -36,6 +36,12 @@ type Client struct {
 	subMu sync.RWMutex
 	subs  map[uint32]map[chan *Message]struct{}
 
+	// videoSubs holds msgIDVideo subscribers keyed by StreamType (main/sub/extern) instead
+	// of the generic subs map, so concurrently active streams never compete for the same
+	// subscriber channel's buffer space. See readLoop.
+	videoSubMu sync.RWMutex
+	videoSubs  map[uint8]map[chan *Message]struct{}
+
 	closed    chan struct{}
 	closeOnce sync.Once
 	closeErr  closeState
@@ -94,6 +100,7 @@ func Dial(ctx context.Context, cfg Config) (*Client, error) {
 		binaryMsgNums: make(map[uint16]struct{}),
 		pending:       make(map[pendingKey]chan *Message),
 		subs:          make(map[uint32]map[chan *Message]struct{}),
+		videoSubs:     make(map[uint8]map[chan *Message]struct{}),
 		closed:        make(chan struct{}),
 	}
 
@@ -120,6 +127,30 @@ func (c *Client) readLoop() {
 			case respCh <- msg:
 			default:
 			}
+		}
+
+		// Video messages are dispatched by (msgID, StreamType) via videoSubs, not the
+		// generic per-msgID subs map: Main and Sub streams share one msgIDVideo, and the
+		// generic map fans every message for a msgID out to every subscriber regardless of
+		// which stream it belongs to. Since Main runs at far higher volume than Sub, Sub's
+		// 64-slot channel would fill up with Main messages it only discards downstream
+		// (via the StreamType check in StartPreview), silently dropping its own real
+		// packets under readLoop's non-blocking send - visible as periodic freezes on the
+		// low-bitrate stream whenever the high-bitrate one is also active.
+		if msg.Header.MsgID == msgIDVideo {
+			c.videoSubMu.RLock()
+			var subs []chan *Message
+			for ch := range c.videoSubs[msg.Header.StreamType] {
+				subs = append(subs, ch)
+			}
+			c.videoSubMu.RUnlock()
+			for _, ch := range subs {
+				select {
+				case ch <- msg:
+				default:
+				}
+			}
+			continue
 		}
 
 		c.subMu.RLock()
@@ -287,6 +318,35 @@ func (c *Client) Subscribe(msgID uint32) (<-chan *Message, func()) {
 	}
 }
 
+// subscribeVideo attaches a best-effort fanout listener for msgIDVideo messages of one
+// specific StreamType only (main/sub/extern). Unlike Subscribe, which fans every message for
+// a msgID out to every subscriber regardless of content, this keeps a high-volume stream
+// (e.g. Main) from ever crowding a low-volume one (e.g. Sub) out of its own channel buffer.
+func (c *Client) subscribeVideo(streamType uint8) (<-chan *Message, func()) {
+	ch := make(chan *Message, 64)
+
+	c.videoSubMu.Lock()
+	if c.videoSubs[streamType] == nil {
+		c.videoSubs[streamType] = make(map[chan *Message]struct{})
+	}
+	c.videoSubs[streamType][ch] = struct{}{}
+	c.videoSubMu.Unlock()
+
+	var once sync.Once
+	return ch, func() {
+		once.Do(func() {
+			c.videoSubMu.Lock()
+			if subs := c.videoSubs[streamType]; subs != nil {
+				delete(subs, ch)
+				if len(subs) == 0 {
+					delete(c.videoSubs, streamType)
+				}
+			}
+			c.videoSubMu.Unlock()
+		})
+	}
+}
+
 // StartPreview starts live media streaming and returns a parsed bcmedia reader.
 func (c *Client) StartPreview(ctx context.Context, channel uint8, stream Stream) (*MediaReader, error) {
 	if err := c.Login(ctx); err != nil {
@@ -299,7 +359,7 @@ func (c *Client) StartPreview(ctx context.Context, channel uint8, stream Stream)
 		return nil, err
 	}
 
-	sub, unsubscribe := c.Subscribe(msgIDVideo)
+	sub, unsubscribe := c.subscribeVideo(streamType)
 	if _, err := c.sendRequest(ctx, request{
 		MsgID:      msgIDVideo,
 		ChannelID:  channel,

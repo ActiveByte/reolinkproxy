@@ -240,8 +240,16 @@ func (h *rtspServerHandler) OnPlay(ctx *gortsplib.ServerHandlerOnPlayCtx) (*base
 	}
 
 	if !state.playing {
-		log.Printf("RTSP Client PLAY: path=%s", ctx.Path)
-		state.stream.addClient(ctx.Session)
+		remoteAddr := ""
+		if ctx.Conn != nil && ctx.Conn.NetConn() != nil {
+			remoteAddr = ctx.Conn.NetConn().RemoteAddr().String()
+		}
+		transport := "unknown"
+		if t := ctx.Session.Transport(); t != nil {
+			transport = t.Protocol.String()
+		}
+		log.Printf("RTSP Client PLAY: path=%s remote=%s transport=%s", ctx.Path, remoteAddr, transport)
+		state.stream.addClient(ctx.Session, remoteAddr)
 		state.playing = true
 	}
 
@@ -299,13 +307,20 @@ func (h *rtspServerHandler) OnGetParameter(_ *gortsplib.ServerHandlerOnGetParame
 	return &base.Response{StatusCode: base.StatusOK}, nil
 }
 
+// rtspClientInfo records identifying information about a connected RTSP client, so the web
+// UI can show which IPs (e.g. UniFi Protect) are actually pulling a given stream.
+type rtspClientInfo struct {
+	RemoteAddr  string
+	ConnectedAt time.Time
+}
+
 type rtspStreamHandler struct {
 	server *gortsplib.Server
 	path   string
 
 	mu      sync.RWMutex
 	stream  *gortsplib.ServerStream
-	clients map[*gortsplib.ServerSession]struct{}
+	clients map[*gortsplib.ServerSession]rtspClientInfo
 	extras  []*description.Media
 	mirrors []*rtspStreamHandler
 }
@@ -313,7 +328,7 @@ type rtspStreamHandler struct {
 func newRTSPStreamHandler(path string) *rtspStreamHandler {
 	return &rtspStreamHandler{
 		path:    strings.TrimPrefix(path, "/"),
-		clients: make(map[*gortsplib.ServerSession]struct{}),
+		clients: make(map[*gortsplib.ServerSession]rtspClientInfo),
 	}
 }
 
@@ -350,10 +365,10 @@ func (h *rtspStreamHandler) ready() bool {
 	return h.stream != nil
 }
 
-func (h *rtspStreamHandler) addClient(session *gortsplib.ServerSession) {
+func (h *rtspStreamHandler) addClient(session *gortsplib.ServerSession, remoteAddr string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.clients[session] = struct{}{}
+	h.clients[session] = rtspClientInfo{RemoteAddr: remoteAddr, ConnectedAt: time.Now()}
 }
 
 func (h *rtspStreamHandler) removeClient(session *gortsplib.ServerSession) {
@@ -377,6 +392,23 @@ func (h *rtspStreamHandler) hasClients() bool {
 		}
 	}
 	return false
+}
+
+// Clients returns identifying info for every currently-connected RTSP client, including
+// those connected to mirrored (talk/backchannel) stream handlers.
+func (h *rtspStreamHandler) Clients() []rtspClientInfo {
+	h.mu.RLock()
+	out := make([]rtspClientInfo, 0, len(h.clients))
+	for _, info := range h.clients {
+		out = append(out, info)
+	}
+	mirrors := append([]*rtspStreamHandler(nil), h.mirrors...)
+	h.mu.RUnlock()
+
+	for _, mirror := range mirrors {
+		out = append(out, mirror.Clients()...)
+	}
+	return out
 }
 
 func (h *rtspStreamHandler) setReady(medias ...*description.Media) error {

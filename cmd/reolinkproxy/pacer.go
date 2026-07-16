@@ -86,7 +86,8 @@ func (p *mediaPacer) warnOverflowOnce() {
 // schedule per maxLead / snapOnPast / initialLatency, then writes each RTP
 // packet to the handler and advances the cursor by item.duration.
 func (p *mediaPacer) run(ctx context.Context) {
-	var nextEmitAt time.Time
+	var anchor time.Time
+	var hasAnchor bool
 
 	for {
 		var item pacedFrame
@@ -102,24 +103,57 @@ func (p *mediaPacer) run(ctx context.Context) {
 
 		now := time.Now()
 
-		// Re-anchor:
-		// 1. Cursor too far in the future → snap to now (burst / startup).
-		// 2. Cursor in the past → snap to now only when snapOnPast (audio).
-		//    Otherwise keep the past target so we burst-drain (video slope).
-		var target time.Time
-		switch {
-		case !nextEmitAt.IsZero() && nextEmitAt.After(now.Add(p.maxLead)):
-			target = now
-		case !nextEmitAt.IsZero() && p.snapOnPast && nextEmitAt.Before(now):
-			target = now
-		case !nextEmitAt.IsZero():
-			target = nextEmitAt
-		default:
-			target = now.Add(p.initialLatency)
+		// naturalTarget is THIS item's own target: anchor (the previous item's target) plus
+		// THIS item's own duration (the interval from the previous frame to this one, per
+		// videoPaceState.durationForFrame). Using this item's own duration - not the
+		// previous item's - matters: an earlier version advanced the schedule by the
+		// PREVIOUS item's duration when computing THIS item's wait, silently applying each
+		// frame's spacing to its successor instead of itself. That's invisible when frame
+		// spacing is perfectly uniform, but this camera's Extern/Sub stream's real spacing
+		// alternates (confirmed via live capture: ~40ms/~80ms), so the off-by-one produced
+		// a persistent anti-phase jitter - every other frame emitted too early, the other
+		// too late by the same amount.
+		var naturalTarget time.Time
+		if hasAnchor {
+			naturalTarget = addDurationClampOverflow(anchor, item.duration)
+		} else {
+			naturalTarget = now.Add(p.initialLatency)
 		}
 
-		if target.After(now) {
-			delay := time.Until(target)
+		// Re-anchor. waitUntil controls when THIS (already-due) packet goes out; newAnchor
+		// is the baseline the NEXT packet's naturalTarget advances from. These stay
+		// independent: on a re-anchor we want to emit the current packet immediately
+		// (waitUntil=now), not delay it by initialLatency too - that would turn "restore
+		// some buffer margin" into "insert an initialLatency-long stall into live
+		// playback", which is worse than the problem it's meant to fix.
+		//
+		// 1. Cursor too far in the future → we've built up excess lead (burst catch-up,
+		//    or overshoot from case 2 below) - snap newAnchor back to bare now, NOT
+		//    now+initialLatency. Re-inflating latency here created a self-sustaining loop:
+		//    drift up to maxLead, snap to initialLatency, drift back up to maxLead, repeat
+		//    - which pinned the queue at a permanent ~3s backlog that Protect's live-edge
+		//    logic then had to fight by playing back faster than 1x.
+		// 2. Cursor in the past → emit now only when snapOnPast (audio, and video for
+		//    low-priority streams). Otherwise keep the past target so we burst-drain
+		//    (video slope) - this is the one case where waitUntil intentionally lags now.
+		//    This is the only branch that restores the initialLatency cushion, since it's
+		//    the one actually recovering from a real stall and benefiting from headroom
+		//    against the next one.
+		var waitUntil, newAnchor time.Time
+		switch {
+		case hasAnchor && naturalTarget.After(now.Add(p.maxLead)):
+			waitUntil = now
+			newAnchor = now
+		case hasAnchor && p.snapOnPast && naturalTarget.Before(now):
+			waitUntil = now
+			newAnchor = now.Add(p.initialLatency)
+		default:
+			waitUntil = naturalTarget
+			newAnchor = naturalTarget
+		}
+
+		if waitUntil.After(now) {
+			delay := time.Until(waitUntil)
 			timer := time.NewTimer(delay)
 			select {
 			case <-ctx.Done():
@@ -137,9 +171,11 @@ func (p *mediaPacer) run(ctx context.Context) {
 			}
 		}
 
-		// Schedule absolutely from target, not time.Now(), so scheduler
-		// jitter does not drift the RTP↔wall slope.
-		nextEmitAt = addDurationClampOverflow(target, item.duration)
+		// anchor becomes this item's own target (newAnchor already includes this item's
+		// duration where relevant - see naturalTarget above), so the NEXT item's duration
+		// gets added exactly once, not accumulated twice.
+		anchor = newAnchor
+		hasAnchor = true
 	}
 }
 

@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -16,6 +18,7 @@ import (
 	gortsplib "github.com/bluenviron/gortsplib/v5"
 	"github.com/bluenviron/gortsplib/v5/pkg/description"
 	"github.com/bluenviron/gortsplib/v5/pkg/format"
+	"github.com/google/uuid"
 	"github.com/urfave/cli/v3"
 
 	"github.com/bluenviron/gortsplib/v5/pkg/format/rtph264"
@@ -31,6 +34,14 @@ var (
 	Commit  = "none"
 	cfg     = defaultConfig()
 )
+
+// onvifUUIDNamespace is a fixed, arbitrary namespace used to derive stable per-camera
+// ONVIF device UUIDs from each camera's serial number (see buildCameraONVIFConfig).
+var onvifUUIDNamespace = uuid.MustParse("6d3b1c0a-6e1b-4f8a-9a1e-1a2b3c4d5e6f")
+
+// restartRequested is set by the web UI's restart endpoint before it triggers a graceful
+// shutdown, so main() knows to respawn the process instead of just exiting.
+var restartRequested atomic.Bool
 
 func envVars(names ...string) cli.ValueSourceChain {
 	prefixed := make([]string, len(names))
@@ -113,11 +124,32 @@ func main() {
 				Destination: &cfg.Server.PprofAddress,
 			},
 			&cli.StringFlag{
+				Name:        "config-file",
+				Usage:       "path to the YAML config file used to persist cameras added/edited via the web UI",
+				Sources:     envVars("CONFIG_FILE"),
+				Value:       cfg.Server.ConfigFile,
+				Destination: &cfg.Server.ConfigFile,
+			},
+			&cli.StringFlag{
+				Name:        "web-address",
+				Usage:       "status/config web ui listen address",
+				Sources:     envVars("WEB_ADDRESS"),
+				Value:       cfg.Server.WebAddress,
+				Destination: &cfg.Server.WebAddress,
+			},
+			&cli.StringFlag{
 				Name:        "server-advertise-host",
 				Usage:       "advertise host for onvif and rtsp",
 				Sources:     envVars("SERVER_ADVERTISE_HOST"),
 				Value:       cfg.Server.AdvertiseHost,
 				Destination: &cfg.Server.AdvertiseHost,
+			},
+			&cli.StringFlag{
+				Name:        "server-protect-ip",
+				Usage:       "expected IP address of the NVR (e.g. UniFi Protect) for the web UI's connected/offline indicator",
+				Sources:     envVars("SERVER_PROTECT_IP"),
+				Value:       cfg.Server.ProtectServerIP,
+				Destination: &cfg.Server.ProtectServerIP,
 			},
 			&cli.StringFlag{
 				Name:        "server-log-level",
@@ -206,13 +238,24 @@ func main() {
 			if err != nil {
 				return fmt.Errorf("load cameras from environment: %w", err)
 			}
-			cfg.Cameras = envCameras
 
-			if len(cfg.Cameras) == 0 {
-				return fmt.Errorf("no cameras defined in environment")
+			store, err := newConfigStore(cfg.Server.ConfigFile, *cfg)
+			if err != nil {
+				return fmt.Errorf("load config file: %w", err)
+			}
+			// The config file is authoritative for cameras once it has any. Env vars only
+			// bootstrap it on a first run where the file is still empty, so cameras
+			// added/edited/removed via the web UI always survive a restart.
+			if err := store.ReplaceCamerasIfEmpty(envCameras, cfg.Server.ONVIFBasePort); err != nil {
+				return fmt.Errorf("bootstrap cameras from environment: %w", err)
 			}
 
-			return runApp(ctx, cfg)
+			cfg.Cameras = store.Cameras()
+			if len(cfg.Cameras) == 0 {
+				return fmt.Errorf("no cameras defined - add one via the web UI at %s, edit %s directly, or set REOLINK_CAMERA_0_* environment variables", cfg.Server.WebAddress, cfg.Server.ConfigFile)
+			}
+
+			return runApp(ctx, cfg, store)
 		},
 	}
 	exitCode := 0
@@ -221,9 +264,38 @@ func main() {
 		exitCode = 1
 	}
 	log.Sync()
+
+	if exitCode == 0 && restartRequested.Load() {
+		if err := respawnSelf(); err != nil {
+			fmt.Fprintf(os.Stderr, "restart: failed to respawn: %v\n", err)
+			exitCode = 1
+		}
+	}
+
 	if exitCode != 0 {
 		os.Exit(exitCode)
 	}
+}
+
+// respawnSelf launches a fresh copy of this process with the same arguments and
+// environment, then returns without waiting for it - the current process is about to exit,
+// having already released every port it held (runApp's deferred Shutdown calls have already
+// run by the time main() reaches this point).
+func respawnSelf() error {
+	exe, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("resolve own executable path: %w", err)
+	}
+
+	cmd := exec.Command(exe, os.Args[1:]...)
+	cmd.Env = os.Environ()
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Stdin = os.Stdin
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("start replacement process: %w", err)
+	}
+	return nil
 }
 
 func signalContext(ctx context.Context) (context.Context, context.CancelFunc) {
@@ -311,7 +383,7 @@ func setupCameraStreams(
 			ctx,
 			device,
 			uint8(camCfg.Channel), //#nosec G115
-			parseStream(s),
+			camCfg.resolveBaichuanStream(s),
 			streamHandler,
 			meta,
 			cfg.Server,
@@ -337,7 +409,7 @@ func setupCameraStreams(
 	return metas
 }
 
-func runApp(ctx context.Context, cfg *Config) error {
+func runApp(ctx context.Context, cfg *Config, store *ConfigStore) error {
 	ctx, cancel := signalContext(ctx)
 	defer cancel()
 	defer log.Printf("application stopped")
@@ -375,8 +447,6 @@ func runApp(ctx context.Context, cfg *Config) error {
 		log.Printf("periodic RTCP Sender Reports: enabled")
 	}
 
-	var metas []*streamMetadata
-
 	// Initialize MQTT client once
 	mqttClient, err := connectMQTT(cfg.MQTT)
 	if err != nil {
@@ -388,6 +458,11 @@ func runApp(ctx context.Context, cfg *Config) error {
 			mqttClient.Disconnect(250)
 		}()
 	}
+
+	serverErrCh := make(chan error, 1)
+	var onvifServers []*http.Server
+	var onvifCfgs []onvifConfig
+	statusReg := newStatusRegistry(serverHandler)
 
 	// Connect to each camera and setup streams
 	for _, camCfg := range cfg.Cameras {
@@ -418,62 +493,112 @@ func runApp(ctx context.Context, cfg *Config) error {
 		log.Printf("talk path registered camera=%s path=%s", camCfg.Name, talkPath)
 
 		var motionState *cameraMotionState
-		if mqttClient != nil || camCfg.PauseOnMotion {
-			motionState = newCameraMotionState()
-			device.WatchMotion(ctx, uint8(camCfg.Channel), motionState.setActive, motionState.markUnsupported) //#nosec G115
-		}
+		motionState = newCameraMotionState()
+		device.WatchMotion(ctx, uint8(camCfg.Channel), motionState.setActive, motionState.markUnsupported) //#nosec G115
 
 		camMetas := setupCameraStreams(ctx, cfg, camCfg, device, serverHandler, talkPublisher, motionState)
-		metas = append(metas, camMetas...)
 
 		if mqttClient != nil {
 			registerCameraMQTT(ctx, mqttClient, cfg.MQTT, device, camCfg.Name, uint8(camCfg.Channel), motionState) //#nosec G115
 		}
+
+		cameraClient := newCameraONVIFClient(camCfg.Host, camCfg.CameraONVIFPort, camCfg.Username, camCfg.Password)
+
+		onvifCfg := buildCameraONVIFConfig(cfg, camCfg)
+		// Report the camera's own real ONVIF device identity (Manufacturer/Model/
+		// FirmwareVersion/HardwareId/SerialNumber) instead of a generic placeholder, when
+		// it's reachable at startup - some NVRs may behave differently for recognized
+		// hardware. Falls back to the generic default (set in buildCameraONVIFConfig) if the
+		// camera's own ONVIF service doesn't respond in time.
+		if info, err := fetchCameraDeviceInfo(ctx, cameraClient); err == nil {
+			onvifCfg.Manufacturer = info.Manufacturer
+			onvifCfg.Model = info.Model
+			if info.FirmwareVersion != "" {
+				onvifCfg.FirmwareVersion = info.FirmwareVersion
+			}
+			if info.HardwareID != "" {
+				onvifCfg.HardwareID = info.HardwareID
+			}
+			if info.SerialNumber != "" {
+				onvifCfg.SerialNumber = info.SerialNumber
+			}
+			log.Printf("camera %s: using real device identity manufacturer=%q model=%q", camCfg.Name, info.Manufacturer, info.Model)
+		} else {
+			log.Warnf("camera %s: could not fetch real device identity, using default: %v", camCfg.Name, err)
+		}
+		onvifCfgs = append(onvifCfgs, onvifCfg)
+
+		// Events forwarded to the NVR come only from the camera's own ONVIF events service
+		// (see runCameraEventForwarder below) - the Baichuan-derived motionState signal is
+		// used for the web UI's status display and MQTT, not broadcast as a second,
+		// duplicate Motion event alongside the camera's real one.
+		eventsBroker := newEventsBroker(camCfg.Name)
+
+		runCameraEventForwarder(ctx, camCfg.Name, cameraClient, eventsBroker)
+
+		statusReg.register(&cameraStatus{
+			Name:           camCfg.Name,
+			Host:           camCfg.Host,
+			ONVIFPort:      camCfg.ONVIFPort,
+			ONVIFMAC:       camCfg.ONVIFMAC,
+			ONVIFSerial:    camCfg.ONVIFSerial,
+			ONVIFAuthority: advertisedAuthority(onvifCfg.Address, onvifCfg.AdvertiseHost),
+			device:         device,
+			metas:          camMetas,
+			motion:         motionState,
+			events:         eventsBroker,
+		})
+
+		onvifSrv := &http.Server{
+			Addr:              onvifCfg.Address,
+			Handler:           newONVIFHandler(onvifCfg, camMetas, eventsBroker, cameraClient),
+			ReadHeaderTimeout: 5 * time.Second,
+		}
+		onvifServers = append(onvifServers, onvifSrv)
+
+		go func(camName string, cfg onvifConfig, srv *http.Server) {
+			log.Printf("onvif service listening camera=%s address=%s", camName, cfg.Address)
+			if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				serverErrCh <- fmt.Errorf("start onvif server for camera %s: %w", camName, err)
+				cancel()
+			}
+		}(camCfg.Name, onvifCfg, onvifSrv)
 	}
 
-	onvifCfg := onvifConfig{
-		Address:         cfg.Server.ONVIFAddress,
-		DevicePath:      "/onvif/device_service",
-		MediaPath:       "/onvif/media_service",
-		Media2Path:      "/onvif/media2_service",
-		AdvertiseHost:   cfg.Server.AdvertiseHost,
-		RTSPAddress:     cfg.Server.RTSPAddress,
-		RTSPPath:        "", // Extracted per-camera in onvif
-		DeviceName:      "ReolinkProxy",
-		Manufacturer:    "ReolinkProxy",
-		Model:           "Multi-Camera NVR",
-		FirmwareVersion: Version,
-		SerialNumber:    "reolinkproxy-nvr",
-		HardwareID:      "reolinkproxy",
-		Username:        cfg.ONVIF.Username,
-		Password:        cfg.ONVIF.Password,
-	}
+	startWSDiscovery(onvifCfgs)
 
-	startWSDiscovery(onvifCfg)
-
-	onvifServer := &http.Server{
-		Addr:              onvifCfg.Address,
-		Handler:           newONVIFHandler(onvifCfg, metas),
+	webSrv := &http.Server{
+		Addr: cfg.Server.WebAddress,
+		Handler: newWebUIHandler(store, statusReg, cfg.Server.ONVIFBasePort, func() {
+			restartRequested.Store(true)
+			cancel()
+		}),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
-	serverErrCh := make(chan error, 1)
 	go func() {
-		if err := onvifServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			serverErrCh <- fmt.Errorf("start onvif server: %w", err)
+		log.Printf("web ui listening at %s", cfg.Server.WebAddress)
+		if err := webSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			serverErrCh <- fmt.Errorf("start web ui server: %w", err)
 			cancel()
 		}
 	}()
+
 	defer func() {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		log.Debugf("onvif server shutting down")
-		if err := onvifServer.Shutdown(shutdownCtx); err != nil {
-			log.Printf("onvif server shutdown error: %v", err)
+		log.Debugf("web ui server shutting down")
+		if err := webSrv.Shutdown(shutdownCtx); err != nil {
+			log.Printf("web ui server shutdown error: %v", err)
+		}
+		for _, srv := range onvifServers {
+			log.Debugf("onvif server shutting down addr=%s", srv.Addr)
+			if err := srv.Shutdown(shutdownCtx); err != nil {
+				log.Printf("onvif server shutdown error: %v", err)
+			}
 		}
 	}()
 
 	log.Printf("rtsp server listening at %s", cfg.Server.RTSPAddress)
-	log.Printf("onvif device service listening at %s%s", cfg.Server.ONVIFAddress, onvifCfg.DevicePath)
 
 	select {
 	case <-ctx.Done():
@@ -481,6 +606,55 @@ func runApp(ctx context.Context, cfg *Config) error {
 		return nil
 	case err := <-serverErrCh:
 		return err
+	}
+}
+
+// fetchCameraDeviceInfo queries a camera's own ONVIF GetDeviceInformation with a short
+// timeout, so a slow/unreachable camera can't stall the whole application's startup.
+func fetchCameraDeviceInfo(ctx context.Context, client *cameraONVIFClient) (cameraDeviceInfo, error) {
+	timeoutCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	return client.getDeviceInformation(timeoutCtx)
+}
+
+// buildCameraONVIFConfig builds the per-camera ONVIF service configuration: its own port,
+// its own stable fake MAC/serial/UUID, and its own device name, so NVRs such as UniFi
+// Protect see and can adopt each camera as an independent ONVIF device.
+//
+// ONVIF credentials default to admin:admin for every camera, regardless of the camera's
+// own Baichuan login, so NVRs can be configured with one simple login across all cameras.
+// The global --onvif-username/--onvif-password flags still win if set.
+func buildCameraONVIFConfig(cfg *Config, camCfg CameraConfig) onvifConfig {
+	deviceUUID := uuid.NewSHA1(onvifUUIDNamespace, []byte(camCfg.ONVIFSerial)).String()
+
+	username := cfg.ONVIF.Username
+	if username == "" {
+		username = "admin"
+	}
+	password := cfg.ONVIF.Password
+	if password == "" {
+		password = "admin"
+	}
+
+	return onvifConfig{
+		Address:         fmt.Sprintf(":%d", camCfg.ONVIFPort),
+		DevicePath:      "/onvif/device_service",
+		MediaPath:       "/onvif/media_service",
+		Media2Path:      "/onvif/media2_service",
+		EventsPath:      "/onvif/events_service",
+		AdvertiseHost:   cfg.Server.AdvertiseHost,
+		RTSPAddress:     cfg.Server.RTSPAddress,
+		RTSPPath:        "",
+		DeviceName:      camCfg.Name,
+		Manufacturer:    "ReolinkProxy",
+		Model:           "IPC-BO",
+		FirmwareVersion: Version,
+		SerialNumber:    camCfg.ONVIFSerial,
+		HardwareID:      "reolinkproxy",
+		Username:        username,
+		Password:        password,
+		HwAddress:       camCfg.ONVIFMAC,
+		DeviceUUID:      deviceUUID,
 	}
 }
 
@@ -520,12 +694,36 @@ func runStream(
 
 	startupDeadline := time.Now().Add(2 * time.Second)
 
+	// The Low/Sub tier forces snapOnPast regardless of the server-wide video pacer setting:
+	// on a stall it re-anchors to now instead of burst-draining queued frames to catch up
+	// (Main's default behavior, which preserves long-term timing slope). NVR live-view
+	// buffers are typically far less forgiving of a burst than a player like VLC is - a
+	// clean re-anchor reads as one skip, where a burst reads as a stutter.
+	//
+	// It also gets a much smaller initial buffer than the server-wide default. That
+	// default (1.5s) is sized for a high-framerate Main stream and is largely invisible
+	// there because Main's default (non-snapOnPast) pacing periodically burst-drains and
+	// sheds accumulated latency. Sub's snapOnPast pacing paces precisely forever and never
+	// sheds it, so the 1.5s startup wait becomes a *permanent* ~3s latency floor (confirmed
+	// via live queue-depth diagnostics: sub's video channel sat pinned at ~59/400 - the
+	// exact backlog that piles up upstream during a 1.5s wait at ~20fps). A player with no
+	// live-edge correction (VLC) just displays the extra delay invisibly; an NVR's live
+	// view (Protect) actively fights it by playing back faster than 1x to shrink its
+	// buffer, which is the "skip" being seen. A low-priority tier should default to low
+	// latency, not smoothness-over-latency like Main.
+	videoSnapOnPast := server.VideoPacerSnapOnPast
+	videoInitialLatency := server.videoPacerInitialLatency()
+	if meta.name == "sub" {
+		videoSnapOnPast = true
+		videoInitialLatency = 700 * time.Millisecond
+	}
+
 	var videoPace videoPaceState
 	videoPacer := &mediaPacer{
 		ch:             make(chan pacedFrame, 400),
 		maxLead:        server.videoPacerMaxLead(),
-		initialLatency: server.videoPacerInitialLatency(),
-		snapOnPast:     server.VideoPacerSnapOnPast,
+		initialLatency: videoInitialLatency,
+		snapOnPast:     videoSnapOnPast,
 		handler:        handler,
 	}
 	go videoPacer.run(ctx)
@@ -909,4 +1107,15 @@ func parseStream(v string) baichuan.Stream {
 	default:
 		return baichuan.StreamMain
 	}
+}
+
+// resolveBaichuanStream is like parseStream but honors SubUsesExtern: when set, the "sub"
+// role pulls the camera's Extern channel instead of its Sub channel, while every downstream
+// consumer (RTSP path, ONVIF token/profile) still only ever sees "sub" - the swap is purely
+// about which upstream Baichuan channel feeds that role.
+func (c CameraConfig) resolveBaichuanStream(streamName string) baichuan.Stream {
+	if streamName == "sub" && c.SubUsesExtern {
+		return baichuan.StreamExtern
+	}
+	return parseStream(streamName)
 }
