@@ -55,7 +55,7 @@ const realCameraMotionPullXML = `<?xml version="1.0" encoding="UTF-8"?>
 func TestCameraONVIFClientGetCapabilitiesParsesRealCameraResponse(t *testing.T) {
 	t.Parallel()
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = io.WriteString(w, realCameraCapabilitiesXML)
 	}))
 	defer srv.Close()
@@ -76,7 +76,7 @@ func TestCameraONVIFClientGetCapabilitiesParsesRealCameraResponse(t *testing.T) 
 func TestCameraONVIFClientCreatePullPointSubscription(t *testing.T) {
 	t.Parallel()
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = io.WriteString(w, realCameraCreateSubscriptionXML)
 	}))
 	defer srv.Close()
@@ -94,7 +94,7 @@ func TestCameraONVIFClientCreatePullPointSubscription(t *testing.T) {
 func TestCameraONVIFClientPullMessagesParsesMotionAndSkipsEmptyData(t *testing.T) {
 	t.Parallel()
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = io.WriteString(w, realCameraMotionPullXML)
 	}))
 	defer srv.Close()
@@ -172,7 +172,7 @@ func TestCameraONVIFClientSnapshotUsesReolinkQueryParamAuth(t *testing.T) {
 func TestCameraONVIFClientSnapshotSurfacesNon200Status(t *testing.T) {
 	t.Parallel()
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)
 	}))
 	defer srv.Close()

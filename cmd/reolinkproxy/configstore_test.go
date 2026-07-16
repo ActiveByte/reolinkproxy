@@ -163,4 +163,3 @@ func TestConfigStoreHealsLegacyStreamValueOnLoad(t *testing.T) {
 		t.Fatalf("expected healed stream value to be persisted to disk, got:\n%s", onDisk)
 	}
 }
-

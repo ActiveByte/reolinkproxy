@@ -124,4 +124,3 @@ func TestMergeServerDefaultsFillsZeroValuedFieldsOnly(t *testing.T) {
 		t.Fatalf("expected WebAddress to always come from CLI/env, got %q", merged.WebAddress)
 	}
 }
-

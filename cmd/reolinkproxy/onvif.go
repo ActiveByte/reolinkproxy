@@ -569,7 +569,7 @@ func (s *onvifServer) getMeta(token string) *streamMetadata {
 }
 
 func (s *onvifServer) mediaSnapshotURIResponse(r *http.Request, body string) string {
-	token := s.extractToken(body, "ProfileToken")
+	token := s.extractToken(body)
 	m := s.getMeta(token)
 
 	// If we have metadata, we use the actual RTSP path since that's where the stream is mounted
@@ -585,7 +585,7 @@ func (s *onvifServer) mediaSnapshotURIResponse(r *http.Request, body string) str
 }
 
 func (s *onvifServer) media2SnapshotURIResponse(r *http.Request, body string) string {
-	token := s.extractToken(body, "ProfileToken")
+	token := s.extractToken(body)
 	m := s.getMeta(token)
 
 	path := "camera/main"
@@ -610,7 +610,7 @@ func (s *onvifServer) mediaProfilesResponse() string {
 }
 
 func (s *onvifServer) mediaProfileResponse(body string) string {
-	token := s.extractToken(body, "ProfileToken")
+	token := s.extractToken(body)
 	m := s.getMeta(token)
 	return `<trt:GetProfileResponse>` + s.profileXML("trt:Profile", token, m) + `</trt:GetProfileResponse>`
 }
@@ -646,8 +646,8 @@ func extractOptionalElement(body, element string) (string, bool) {
 // extractToken is for REQUIRED token fields (e.g. GetStreamUri's ProfileToken) - callers
 // need some token to act on even if parsing fails, so this falls back to the first
 // configured stream rather than an empty string.
-func (s *onvifServer) extractToken(body, element string) string {
-	if value, ok := extractOptionalElement(body, element); ok {
+func (s *onvifServer) extractToken(body string) string {
+	if value, ok := extractOptionalElement(body, "ProfileToken"); ok {
 		return value
 	}
 
@@ -662,7 +662,7 @@ func (s *onvifServer) extractToken(body, element string) string {
 }
 
 func (s *onvifServer) mediaStreamURIResponse(r *http.Request, body string) string {
-	token := s.extractToken(body, "ProfileToken")
+	token := s.extractToken(body)
 	m := s.getMeta(token)
 	path := s.cfg.RTSPPath
 	if m != nil && m.path != "" {

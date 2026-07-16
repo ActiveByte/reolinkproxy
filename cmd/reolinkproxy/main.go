@@ -486,8 +486,7 @@ func runApp(ctx context.Context, cfg *Config, store *ConfigStore) error {
 		serverHandler.addTalk(talkPath, talkPublisher)
 		log.Printf("talk path registered camera=%s path=%s", camCfg.Name, talkPath)
 
-		var motionState *cameraMotionState
-		motionState = newCameraMotionState()
+		motionState := newCameraMotionState()
 		device.WatchMotion(ctx, uint8(camCfg.Channel), motionState.setActive, motionState.markUnsupported) //#nosec G115
 
 		camMetas := setupCameraStreams(ctx, cfg, camCfg, device, serverHandler, talkPublisher, motionState)

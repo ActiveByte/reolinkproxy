@@ -414,7 +414,7 @@ func (h *webUIServer) handleUpdateCamera(w http.ResponseWriter, r *http.Request)
 // handleRestart acknowledges the request immediately (so the browser sees a response
 // before the connection drops) and triggers the actual shutdown/respawn shortly after, off
 // the request goroutine.
-func (h *webUIServer) handleRestart(w http.ResponseWriter, r *http.Request) {
+func (h *webUIServer) handleRestart(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "restarting"})
 	if f, ok := w.(http.Flusher); ok {
 		f.Flush()

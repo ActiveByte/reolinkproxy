@@ -33,7 +33,7 @@ type ServerConfig struct {
 	// ONVIFBasePort is the first port used to auto-assign per-camera ONVIF services when a
 	// camera doesn't set ONVIFPort explicitly (base port + camera index). Each camera gets
 	// its own ONVIF server on its own port - there is no single shared ONVIF address.
-	ONVIFBasePort int `yaml:"onvif_base_port"`
+	ONVIFBasePort int    `yaml:"onvif_base_port"`
 	PprofAddress  string `yaml:"pprof_address"`
 	AdvertiseHost string `yaml:"advertise_host"`
 	LogLevel      string `yaml:"log_level"`

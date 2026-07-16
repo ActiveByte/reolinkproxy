@@ -451,10 +451,10 @@ var isoDurationRE = regexp.MustCompile(`^PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+
 // parseISODurationClamped parses a minimal xs:duration like "PT30S"/"PT2M", clamping the
 // result to [min, max] and falling back to max if parsing fails. NVRs use this to tell the
 // PullPoint how long it's willing to long-poll for.
-func parseISODurationClamped(raw string, min, max time.Duration) time.Duration {
+func parseISODurationClamped(raw string, minDuration, maxDuration time.Duration) time.Duration {
 	m := isoDurationRE.FindStringSubmatch(strings.TrimSpace(raw))
 	if m == nil {
-		return max
+		return maxDuration
 	}
 	var total time.Duration
 	if m[1] != "" {
@@ -470,13 +470,13 @@ func parseISODurationClamped(raw string, min, max time.Duration) time.Duration {
 		total += time.Duration(s * float64(time.Second))
 	}
 	if total <= 0 {
-		return max
+		return maxDuration
 	}
-	if total < min {
-		return min
+	if total < minDuration {
+		return minDuration
 	}
-	if total > max {
-		return max
+	if total > maxDuration {
+		return maxDuration
 	}
 	return total
 }
