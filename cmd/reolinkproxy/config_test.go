@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -88,6 +89,75 @@ func TestLoadCamerasFromEntries(t *testing.T) {
 	if cameras[1].TalkEncoder != "internal" {
 		t.Fatalf("unexpected second camera default talk encoder: %q", cameras[1].TalkEncoder)
 	}
+
+	if cameras[0].ONVIFPort == 0 || cameras[1].ONVIFPort == 0 {
+		t.Fatal("expected both cameras to get a default onvif port")
+	}
+	if cameras[0].ONVIFPort == cameras[1].ONVIFPort {
+		t.Fatalf("expected distinct default onvif ports, both got %d", cameras[0].ONVIFPort)
+	}
+	if cameras[0].ONVIFMAC == "" || cameras[1].ONVIFMAC == "" {
+		t.Fatal("expected both cameras to get a default onvif mac")
+	}
+	if cameras[0].ONVIFMAC == cameras[1].ONVIFMAC {
+		t.Fatalf("expected distinct default onvif macs for differently-named cameras, both got %q", cameras[0].ONVIFMAC)
+	}
+	if cameras[0].ONVIFSerial == "" || cameras[1].ONVIFSerial == "" {
+		t.Fatal("expected both cameras to get a default onvif serial")
+	}
+	if cameras[0].ONVIFSerial == cameras[1].ONVIFSerial {
+		t.Fatalf("expected distinct default onvif serials, both got %q", cameras[0].ONVIFSerial)
+	}
+}
+
+func TestDeriveFakeMACIsStableAndLocallyAdministered(t *testing.T) {
+	t.Parallel()
+
+	a := deriveFakeMAC("front door")
+	b := deriveFakeMAC("front door")
+	if a != b {
+		t.Fatalf("expected deriveFakeMAC to be deterministic, got %q and %q", a, b)
+	}
+
+	c := deriveFakeMAC("backyard")
+	if a == c {
+		t.Fatalf("expected different names to derive different MACs, both got %q", a)
+	}
+
+	var firstOctet byte
+	if _, err := fmt.Sscanf(a, "%02x:", &firstOctet); err != nil {
+		t.Fatalf("failed to parse first octet of %q: %v", a, err)
+	}
+	if firstOctet&0x01 != 0 {
+		t.Fatalf("expected multicast bit to be clear in %q", a)
+	}
+	if firstOctet&0x02 == 0 {
+		t.Fatalf("expected locally-administered bit to be set in %q", a)
+	}
+}
+
+func TestApplyCameraDefaultsHonorsExplicitONVIFOverrides(t *testing.T) {
+	t.Parallel()
+
+	camera := CameraConfig{
+		Name:        "front",
+		Host:        "192.168.1.10",
+		ONVIFPort:   9999,
+		ONVIFMAC:    "aa:bb:cc:dd:ee:ff",
+		ONVIFSerial: "custom-serial",
+	}
+
+	applyCameraDefaults(&camera, 0, 8102)
+
+	if camera.ONVIFPort != 9999 {
+		t.Fatalf("expected explicit onvif port to be preserved, got %d", camera.ONVIFPort)
+	}
+	if camera.ONVIFMAC != "aa:bb:cc:dd:ee:ff" {
+		t.Fatalf("expected explicit onvif mac to be preserved, got %q", camera.ONVIFMAC)
+	}
+	if camera.ONVIFSerial != "custom-serial" {
+		t.Fatalf("expected explicit onvif serial to be preserved, got %q", camera.ONVIFSerial)
+	}
 }
 
 func TestApplyCameraDefaultsBatteryCameraDoesNotEnableIdleDisconnect(t *testing.T) {
@@ -99,7 +169,7 @@ func TestApplyCameraDefaultsBatteryCameraDoesNotEnableIdleDisconnect(t *testing.
 		BatteryCamera: true,
 	}
 
-	applyCameraDefaults(&camera)
+	applyCameraDefaults(&camera, 0, 8102)
 
 	if camera.IdleDisconnect {
 		t.Fatal("expected battery camera not to enable idle_disconnect automatically")

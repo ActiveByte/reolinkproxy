@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/sha1" //#nosec G505
+	"encoding/hex"
 	"fmt"
 	"os"
 	"reflect"
@@ -30,10 +32,17 @@ type ServerConfig struct {
 	RTPAddress    string `yaml:"rtp_address"`
 	RTCPAddress   string `yaml:"rtcp_address"`
 	ONVIFAddress  string `yaml:"onvif_address"`
+	// ONVIFBasePort is the first port used to auto-assign per-camera ONVIF services when a
+	// camera doesn't set ONVIFPort explicitly (base port + camera index).
+	ONVIFBasePort int    `yaml:"onvif_base_port"`
 	PprofAddress  string `yaml:"pprof_address"`
 	AdvertiseHost string `yaml:"advertise_host"`
 	LogLevel      string `yaml:"log_level"`
 	LogPackets    bool   `yaml:"log_packets"`
+	// ProtectServerIP is the expected IP address of the UniFi Protect (or other NVR) host.
+	// When set, the web UI highlights whether RTSP/ONVIF connections are actually arriving
+	// from this address, to make it visible whether Protect is really talking to a camera.
+	ProtectServerIP string `yaml:"protect_server_ip" json:"protect_server_ip"`
 
 	// AudioPacerInitialLatencyMs is the media pacer startup delay for audio (wall clock before
 	// the first packet is sent). Default 500ms.
@@ -55,6 +64,12 @@ type ServerConfig struct {
 	// DisableRTCPSenderReports suppresses periodic RTCP Sender Reports on published streams (default true).
 	// Some receivers (e.g. FFmpeg) re-anchor decode time on each SR, which can cause non-monotonic DTS warnings.
 	DisableRTCPSenderReports bool `yaml:"disable_rtcp_sender_reports"`
+
+	// ConfigFile is the path to the YAML file used to persist cameras added/edited/removed
+	// through the web UI. Created automatically on first run if it doesn't exist.
+	ConfigFile string `yaml:"-"`
+	// WebAddress is the status/config web UI listen address.
+	WebAddress string `yaml:"-"`
 }
 
 type ONVIFConfig struct {
@@ -63,26 +78,51 @@ type ONVIFConfig struct {
 }
 
 type CameraConfig struct {
-	Name           string        `yaml:"name"`
-	Host           string        `yaml:"host"`
-	Port           int           `yaml:"port"`
-	UID            string        `yaml:"uid"`
-	Username       string        `yaml:"username"`
-	Password       string        `yaml:"password"`
-	Timeout        time.Duration `yaml:"timeout"`
-	Stream         string        `yaml:"stream"`
-	Channel        int           `yaml:"channel"`
-	RTSPPath       string        `yaml:"rtsp_path"`
-	TalkProfile    string        `yaml:"talk_profile"`
-	TalkVolume     int           `yaml:"talk_volume"`
-	TalkEncoder    string        `yaml:"talk_encoder"`
-	TalkEncoderCmd string        `yaml:"talk_encoder_cmd"`
-	PauseOnMotion  bool          `yaml:"pause_on_motion"`
-	PauseOnClient  bool          `yaml:"pause_on_client"`
-	PauseTimeout   time.Duration `yaml:"pause_timeout"`
-	IdleDisconnect bool          `yaml:"idle_disconnect"`
-	IdleTimeout    time.Duration `yaml:"idle_timeout"`
-	BatteryCamera  bool          `yaml:"battery_camera"`
+	Name           string        `yaml:"name" json:"name"`
+	Host           string        `yaml:"host" json:"host"`
+	Port           int           `yaml:"port" json:"port"`
+	UID            string        `yaml:"uid" json:"uid"`
+	Username       string        `yaml:"username" json:"username"`
+	Password       string        `yaml:"password" json:"password"`
+	Timeout        time.Duration `yaml:"timeout" json:"timeout"`
+	Stream         string        `yaml:"stream" json:"stream"`
+	Channel        int           `yaml:"channel" json:"channel"`
+	RTSPPath       string        `yaml:"rtsp_path" json:"rtsp_path"`
+	TalkProfile    string        `yaml:"talk_profile" json:"talk_profile"`
+	TalkVolume     int           `yaml:"talk_volume" json:"talk_volume"`
+	TalkEncoder    string        `yaml:"talk_encoder" json:"talk_encoder"`
+	TalkEncoderCmd string        `yaml:"talk_encoder_cmd" json:"talk_encoder_cmd"`
+	PauseOnMotion  bool          `yaml:"pause_on_motion" json:"pause_on_motion"`
+	PauseOnClient  bool          `yaml:"pause_on_client" json:"pause_on_client"`
+	PauseTimeout   time.Duration `yaml:"pause_timeout" json:"pause_timeout"`
+	IdleDisconnect bool          `yaml:"idle_disconnect" json:"idle_disconnect"`
+	IdleTimeout    time.Duration `yaml:"idle_timeout" json:"idle_timeout"`
+	BatteryCamera  bool          `yaml:"battery_camera" json:"battery_camera"`
+	// SubUsesExtern, when true, serves the "sub" stream role (RTSP path, ONVIF Low
+	// profile) from the camera's Baichuan Extern channel instead of its Sub channel. Some
+	// models' Extern encoder profile is a distinct, more stable tier than Sub - this only
+	// changes which upstream channel is pulled, not the "sub" name/path/ONVIF token exposed
+	// to NVRs, so nothing downstream needs to know about it.
+	SubUsesExtern bool `yaml:"sub_uses_extern" json:"sub_uses_extern"`
+
+	// ONVIFPort is the TCP port this camera's own virtual ONVIF Device/Media/Events
+	// service listens on. Each camera gets its own port so NVRs such as UniFi Protect can
+	// adopt it as an independent device. Defaults to ServerConfig.ONVIFBasePort + the
+	// camera's index if unset.
+	ONVIFPort int `yaml:"onvif_port" json:"onvif_port"`
+	// ONVIFMAC is a stable, fake identifier reported in ONVIF GetNetworkInterfaces/
+	// discovery scopes for this camera. It is NOT a real network-layer MAC (no macvlan/ARP
+	// involved) - it just needs to be unique and stable across restarts. Defaults to a
+	// value deterministically derived from Name if unset.
+	ONVIFMAC string `yaml:"onvif_mac" json:"onvif_mac"`
+	// ONVIFSerial is the serial number reported in ONVIF GetDeviceInformation. Defaults to
+	// a value deterministically derived from Name if unset.
+	ONVIFSerial string `yaml:"onvif_serial" json:"onvif_serial"`
+	// CameraONVIFPort is the port the *camera's own* built-in ONVIF service listens on
+	// (used to forward its events/smart-events and fetch real snapshots) - distinct from
+	// ONVIFPort, which is this proxy's own virtual ONVIF service for that camera. Defaults
+	// to 8000, the common Reolink ONVIF port.
+	CameraONVIFPort int `yaml:"camera_onvif_port" json:"camera_onvif_port"`
 }
 
 var (
@@ -114,6 +154,7 @@ func defaultConfig() *Config {
 			RTPAddress:                 ":8000",
 			RTCPAddress:                ":8001",
 			ONVIFAddress:               ":8002",
+			ONVIFBasePort:              8102,
 			PprofAddress:               "",
 			LogLevel:                   "info",
 			AudioPacerInitialLatencyMs: 500,
@@ -123,6 +164,8 @@ func defaultConfig() *Config {
 			VideoPacerMaxLeadMs:        3000,
 			VideoPacerSnapOnPast:       false,
 			DisableRTCPSenderReports:   true,
+			ConfigFile:                 "config.yml",
+			WebAddress:                 ":8080",
 		},
 		MQTT: MQTTConfig{
 			Topic: "reolinkproxy",
@@ -182,9 +225,9 @@ func loadCamerasFromEntries(entries []string) ([]CameraConfig, error) {
 	sort.Ints(indexes)
 
 	cameras := make([]CameraConfig, 0, len(indexes))
-	for _, cameraIndex := range indexes {
+	for i, cameraIndex := range indexes {
 		camera := *camerasByIndex[cameraIndex]
-		applyCameraDefaults(&camera)
+		applyCameraDefaults(&camera, i, defaultConfig().Server.ONVIFBasePort)
 
 		if err := validateCameraConfig(&camera); err != nil {
 			return nil, fmt.Errorf("REOLINK_CAMERA_%d_*: %w", cameraIndex, err)
@@ -242,7 +285,7 @@ func setFieldFromEnv(field reflect.Value, rawValue string, envKey string) error 
 	return nil
 }
 
-func applyCameraDefaults(camera *CameraConfig) {
+func applyCameraDefaults(camera *CameraConfig, index int, onvifBasePort int) {
 	if camera.Port == 0 {
 		camera.Port = 9000
 	}
@@ -268,6 +311,38 @@ func applyCameraDefaults(camera *CameraConfig) {
 	if camera.IdleTimeout == 0 {
 		camera.IdleTimeout = 30 * time.Second
 	}
+	if camera.ONVIFPort == 0 {
+		camera.ONVIFPort = onvifBasePort + index
+	}
+	if camera.CameraONVIFPort == 0 {
+		camera.CameraONVIFPort = 8000
+	}
+	if camera.ONVIFMAC == "" {
+		camera.ONVIFMAC = deriveFakeMAC(camera.Name)
+	}
+	if camera.ONVIFSerial == "" {
+		camera.ONVIFSerial = deriveSerial(camera.Name)
+	}
+}
+
+// deriveFakeMAC deterministically derives a stable, fake MAC-style identifier from the
+// camera name. It is never used at the network layer (no ARP/macvlan) - ONVIF clients such
+// as UniFi Protect only read it out of GetNetworkInterfaces/discovery scopes as a per-device
+// identifier, so it only needs to be unique and stable across restarts, not a real NIC
+// address. The locally-administered/unicast bit is set on the first octet so it can never
+// collide with a real vendor-assigned MAC.
+func deriveFakeMAC(name string) string {
+	sum := sha1.Sum([]byte("reolinkproxy-onvif-mac:" + name)) //#nosec G401
+	b := make([]byte, 6)
+	copy(b, sum[:6])
+	b[0] = (b[0] &^ 0x01) | 0x02 // clear multicast bit, set locally-administered bit
+	return fmt.Sprintf("%02x:%02x:%02x:%02x:%02x:%02x", b[0], b[1], b[2], b[3], b[4], b[5])
+}
+
+// deriveSerial deterministically derives a stable ONVIF serial number from the camera name.
+func deriveSerial(name string) string {
+	sum := sha1.Sum([]byte("reolinkproxy-onvif-serial:" + name)) //#nosec G401
+	return "rlp-" + hex.EncodeToString(sum[:8])
 }
 
 func validateCameraConfig(camera *CameraConfig) error {
