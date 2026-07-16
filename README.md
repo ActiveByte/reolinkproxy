@@ -2,6 +2,8 @@
 
 A lightweight Go proxy that translates Reolink's proprietary Baichuan protocol into standard RTSP streams and a compliant ONVIF API.
 
+> This is a fork of [shareed2k/reolinkproxy](https://github.com/Shareed2k/reolinkproxy) with a persisted YAML config, a status/config web UI, per-camera ONVIF identity, and Baichuan/RTSP pacing fixes.
+
 It is aimed at battery Reolink cameras and other models that do not expose native RTSP/ONVIF, or that are reachable on the LAN by IP or by Reolink UID (local UDP discovery on the same network segment).
 
 ## Features
@@ -15,6 +17,7 @@ It is aimed at battery Reolink cameras and other models that do not expose nativ
 * Publishes MQTT motion and control topics for Home Assistant and similar systems.
 * Can pause streams or stop preview sessions when cameras are idle.
 * Supports RTSP talkback publish endpoints that bridge client audio into Baichuan two-way audio.
+* Ships a status/config web UI for adding, editing, and monitoring cameras, with live server stats (uptime, memory, goroutines, GC runs).
 
 ## Configuration
 
@@ -215,16 +218,45 @@ Docker healthcheck settings:
 
 By default the Docker image runs `reolinkproxy healthcheck`, which sends RTSP `DESCRIBE` requests to the configured stream paths. Set `REOLINK_HEALTHCHECK_RTSP_ONLY=true` for sleeping battery cameras if you only want to verify that the RTSP listener is up.
 
+## Web UI
+
+The proxy serves a status/config web UI for adding, editing, and monitoring cameras, plus a live server stats panel (uptime, memory, goroutines, GC runs, camera count).
+
+| Environment Variable | CLI Flag | Default |
+| :--- | :--- | :--- |
+| `REOLINK_WEB_ADDRESS` | `--web-address` | `:8080` |
+| `REOLINK_CONFIG_FILE` | `--config-file` | `config.yml` |
+| `REOLINK_SERVER_PROTECT_IP` | `--server-protect-ip` | `""` |
+
+`REOLINK_SERVER_PROTECT_IP` is the expected IP of your NVR (e.g. UniFi Protect); when set, the web UI shows a connected/offline indicator for it.
+
+**Camera precedence:** `REOLINK_CAMERA_<n>_*` environment variables only *bootstrap* the config file on first run, when it's still empty. Once it has cameras — whether from that bootstrap or from the web UI — the config file is authoritative, and cameras added/edited/removed through the web UI persist across restarts. Changing `REOLINK_CAMERA_<n>_*` env vars after that point has no effect unless you delete the config file. `Stream` and `Channel` are set at creation time only and are not editable from the web UI form, since a wrong value silently drops a stream tier.
+
+Mount a volume for the config file so edits survive container recreation:
+
+```yaml
+volumes:
+  - ./config.yml:/config.yml
+environment:
+  - REOLINK_CONFIG_FILE=/config.yml
+```
+
 ## Docker Compose
+
+This fork isn't published to a registry — build it from the cloned source (`build: .`) instead of pulling `ghcr.io/shareed2k/reolinkproxy`, which is upstream and won't include these changes.
 
 ```yaml
 services:
   reolinkproxy:
-    image: ghcr.io/shareed2k/reolinkproxy:latest
+    build: .
+    image: reolinkproxy:latest
     container_name: reolinkproxy
     restart: unless-stopped
     network_mode: host
+    volumes:
+      - ./config.yml:/config.yml
     environment:
+      - REOLINK_CONFIG_FILE=/config.yml
       - REOLINK_CAMERA_0_NAME=front
       - REOLINK_CAMERA_0_HOST=192.168.1.100
       - REOLINK_CAMERA_0_USERNAME=admin
@@ -268,18 +300,23 @@ If you are not using `network_mode: host`, map these ports:
 * `8001/udp` RTCP
 * `8002/tcp` ONVIF
 * `3702/udp` WS-Discovery
+* `8080/tcp` Web UI
 
 ## Docker Run
 
-You can also run the proxy directly using `docker run`:
+You can also run the proxy directly using `docker run`, after building the image locally:
 
 The container image includes GStreamer, so `REOLINK_CAMERA_<n>_TALK_ENCODER=gstreamer` works without installing anything else in the container. The default is the built-in encoder because it is more stable with battery cameras.
 
 ```bash
+docker build -t reolinkproxy:latest .
+
 docker run -d \
   --name reolinkproxy \
   --network host \
   --restart unless-stopped \
+  -v $(pwd)/config.yml:/config.yml \
+  -e REOLINK_CONFIG_FILE=/config.yml \
   -e REOLINK_CAMERA_0_NAME=front \
   -e REOLINK_CAMERA_0_HOST=192.168.1.100 \
   -e REOLINK_CAMERA_0_USERNAME=admin \
@@ -290,7 +327,7 @@ docker run -d \
   -e REOLINK_CAMERA_0_IDLE_TIMEOUT=30s \
   -e REOLINK_ONVIF_USERNAME=admin \
   -e REOLINK_ONVIF_PASSWORD=secret_onvif_password \
-  ghcr.io/shareed2k/reolinkproxy:latest
+  reolinkproxy:latest
 ```
 
 ## CLI Example
@@ -444,7 +481,7 @@ If you provide an `MQTT_BROKER`, the proxy will automatically connect and expose
 ## Building from Source
 
 ```bash
-git clone https://github.com/shareed2k/reolinkproxy.git
+git clone https://github.com/ActiveByte/reolinkproxy.git
 cd reolinkproxy
 go build -o reolinkproxy ./cmd/reolinkproxy
 ```
