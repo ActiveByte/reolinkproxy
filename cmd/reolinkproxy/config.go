@@ -290,7 +290,7 @@ func applyCameraDefaults(camera *CameraConfig, index int, onvifBasePort int) {
 		camera.Port = 9000
 	}
 	if camera.Stream == "" {
-		camera.Stream = "main"
+		camera.Stream = "main,sub"
 	}
 	if camera.RTSPPath == "" {
 		camera.RTSPPath = camera.Name + "/stream"

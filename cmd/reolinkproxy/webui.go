@@ -5,11 +5,16 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 )
+
+// processStartTime is used to report server uptime in the status API. Set at package init,
+// which is close enough to real process start for a diagnostics figure.
+var processStartTime = time.Now()
 
 // cameraStatus is the live, in-memory runtime state for one camera, registered once at
 // startup by runApp. The web UI reads it read-only; it never mutates camera config.
@@ -209,6 +214,7 @@ func newWebUIHandler(store *ConfigStore, status *statusRegistry, onvifBasePort i
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", h.handleIndex)
 	mux.HandleFunc("GET /api/status", h.handleStatus)
+	mux.HandleFunc("GET /api/server-stats", h.handleServerStats)
 	mux.HandleFunc("GET /api/settings", h.handleGetSettings)
 	mux.HandleFunc("PUT /api/settings", h.handleUpdateSettings)
 	mux.HandleFunc("GET /api/cameras", h.handleListCameras)
@@ -280,6 +286,33 @@ func (h *webUIServer) handleIndex(w http.ResponseWriter, r *http.Request) {
 
 func (h *webUIServer) handleStatus(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, h.status.snapshot(h.store.ProtectServerIP()))
+}
+
+type serverStatsView struct {
+	UptimeSeconds int64   `json:"uptime_seconds"`
+	Goroutines    int     `json:"goroutines"`
+	MemAllocMB    float64 `json:"mem_alloc_mb"`
+	MemSysMB      float64 `json:"mem_sys_mb"`
+	NumGC         uint32  `json:"num_gc"`
+	GoVersion     string  `json:"go_version"`
+	NumCPU        int     `json:"num_cpu"`
+	NumCameras    int     `json:"num_cameras"`
+}
+
+func (h *webUIServer) handleServerStats(w http.ResponseWriter, _ *http.Request) {
+	var mem runtime.MemStats
+	runtime.ReadMemStats(&mem)
+
+	writeJSON(w, http.StatusOK, serverStatsView{
+		UptimeSeconds: int64(time.Since(processStartTime).Seconds()),
+		Goroutines:    runtime.NumGoroutine(),
+		MemAllocMB:    float64(mem.Alloc) / (1024 * 1024),
+		MemSysMB:      float64(mem.Sys) / (1024 * 1024),
+		NumGC:         mem.NumGC,
+		GoVersion:     runtime.Version(),
+		NumCPU:        runtime.NumCPU(),
+		NumCameras:    len(h.store.Cameras()),
+	})
 }
 
 type settingsView struct {
@@ -442,6 +475,10 @@ const indexHTML = `<!doctype html>
   #form .row > label { flex: 1; }
   #form .checks label { display: inline-block; margin-right: 1rem; color: var(--text); }
   #formError { color: var(--down); font-size: 0.8rem; margin-top: 0.5rem; }
+  #serverStats { display: flex; flex-wrap: wrap; gap: 1.5rem; padding: 0.7rem 1rem; font-size: 0.8rem; }
+  #serverStats .stat { display: flex; flex-direction: column; gap: 0.15rem; }
+  #serverStats .statLabel { color: var(--muted); font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.03em; }
+  #serverStats span:not(.statLabel) { font-family: var(--mono); }
 </style>
 </head>
 <body>
@@ -458,6 +495,16 @@ const indexHTML = `<!doctype html>
     <span id="settingsSaved" class="muted"></span>
   </div>
   <button id="addBtn" class="primary">+ Add camera</button>
+</div>
+
+<div class="panel" id="serverStats">
+  <div class="stat"><span class="statLabel">Uptime</span><span id="stat_uptime">-</span></div>
+  <div class="stat"><span class="statLabel">Memory</span><span id="stat_mem">-</span></div>
+  <div class="stat"><span class="statLabel">Goroutines</span><span id="stat_goroutines">-</span></div>
+  <div class="stat"><span class="statLabel">GC runs</span><span id="stat_gc">-</span></div>
+  <div class="stat"><span class="statLabel">CPUs</span><span id="stat_cpu">-</span></div>
+  <div class="stat"><span class="statLabel">Go</span><span id="stat_goversion">-</span></div>
+  <div class="stat"><span class="statLabel">Cameras</span><span id="stat_cameras">-</span></div>
 </div>
 
 <div class="panel">
@@ -480,13 +527,10 @@ const indexHTML = `<!doctype html>
     <label>Username<input type="text" id="f_username"></label>
     <label>Password<input type="password" id="f_password"></label>
   </div>
-  <div class="row">
-    <label>Stream<input type="text" id="f_stream" value="main,sub" placeholder="main,sub,extern"></label>
-    <label>Channel<input type="number" id="f_channel" value="0"></label>
-  </div>
   <label>ONVIF port (blank = auto)<input type="number" id="f_onvif_port"></label>
   <div class="checks">
-    <label><input type="checkbox" id="f_pause_on_motion"> Pause stream when idle without motion</label>
+    <label><input type="checkbox" id="f_battery_camera"> Battery-powered camera</label>
+    <label id="f_pause_on_motion_row"><input type="checkbox" id="f_pause_on_motion"> Pause stream when idle without motion</label>
     <label><input type="checkbox" id="f_sub_uses_extern"> Use Extern stream as Sub (higher quality low tier, if the camera supports it)</label>
   </div>
   <div>
@@ -524,10 +568,39 @@ const indexHTML = `<!doctype html>
 
 <script>
 var editing = null; // camera name being edited, or null when adding
+var editingCamera = null; // full camera object being edited, for fields not shown in the form (stream/channel)
 var protectIP = '';
 
 function apiGetStatus() { return fetch('/api/status').then(function(r) { return r.json(); }); }
 function apiGetCameras() { return fetch('/api/cameras').then(function(r) { return r.json(); }); }
+function apiGetServerStats() { return fetch('/api/server-stats').then(function(r) { return r.json(); }); }
+
+function fmtUptime(seconds) {
+  var d = Math.floor(seconds / 86400);
+  var h = Math.floor((seconds % 86400) / 3600);
+  var m = Math.floor((seconds % 3600) / 60);
+  var s = Math.floor(seconds % 60);
+  var parts = [];
+  if (d) parts.push(d + 'd');
+  if (d || h) parts.push(h + 'h');
+  if (d || h || m) parts.push(m + 'm');
+  parts.push(s + 's');
+  return parts.join(' ');
+}
+
+function renderServerStats(stats) {
+  document.getElementById('stat_uptime').textContent = fmtUptime(stats.uptime_seconds);
+  document.getElementById('stat_mem').textContent = stats.mem_alloc_mb.toFixed(1) + ' MB / ' + stats.mem_sys_mb.toFixed(1) + ' MB sys';
+  document.getElementById('stat_goroutines').textContent = stats.goroutines;
+  document.getElementById('stat_gc').textContent = stats.num_gc;
+  document.getElementById('stat_cpu').textContent = stats.num_cpu;
+  document.getElementById('stat_goversion').textContent = stats.go_version;
+  document.getElementById('stat_cameras').textContent = stats.num_cameras;
+}
+
+function refreshServerStats() {
+  apiGetServerStats().then(renderServerStats);
+}
 function apiGetSettings() { return fetch('/api/settings').then(function(r) { return r.json(); }); }
 
 function showBanner() { document.getElementById('banner').classList.add('show'); }
@@ -651,6 +724,7 @@ function saveSettings() {
 function openForm(camera) {
   document.getElementById('formError').textContent = '';
   editing = camera ? camera.name : null;
+  editingCamera = camera || null;
   document.getElementById('formTitle').textContent = camera ? ('Edit ' + camera.name) : 'Add camera';
   document.getElementById('f_name').value = camera ? camera.name : '';
   document.getElementById('f_name').disabled = !!camera;
@@ -658,17 +732,24 @@ function openForm(camera) {
   document.getElementById('f_port').value = camera ? camera.port : 9000;
   document.getElementById('f_username').value = camera ? camera.username : '';
   document.getElementById('f_password').value = camera ? camera.password : '';
-  document.getElementById('f_stream').value = camera ? camera.stream : 'main,sub';
-  document.getElementById('f_channel').value = camera ? camera.channel : 0;
   document.getElementById('f_onvif_port').value = camera && camera.onvif_port ? camera.onvif_port : '';
+  document.getElementById('f_battery_camera').checked = !!(camera && camera.battery_camera);
   document.getElementById('f_pause_on_motion').checked = !!(camera && camera.pause_on_motion);
   document.getElementById('f_sub_uses_extern').checked = !!(camera && camera.sub_uses_extern);
+  updatePauseVisibility();
   document.getElementById('form').classList.add('show');
+}
+
+function updatePauseVisibility() {
+  var batteryCamera = document.getElementById('f_battery_camera').checked;
+  document.getElementById('f_pause_on_motion_row').style.display = batteryCamera ? '' : 'none';
+  if (!batteryCamera) { document.getElementById('f_pause_on_motion').checked = false; }
 }
 
 function closeForm() {
   document.getElementById('form').classList.remove('show');
   editing = null;
+  editingCamera = null;
 }
 
 function saveCamera() {
@@ -678,11 +759,16 @@ function saveCamera() {
     port: parseInt(document.getElementById('f_port').value, 10) || 9000,
     username: document.getElementById('f_username').value,
     password: document.getElementById('f_password').value,
-    stream: document.getElementById('f_stream').value.trim() || 'main',
-    channel: parseInt(document.getElementById('f_channel').value, 10) || 0,
+    battery_camera: document.getElementById('f_battery_camera').checked,
     pause_on_motion: document.getElementById('f_pause_on_motion').checked,
     sub_uses_extern: document.getElementById('f_sub_uses_extern').checked
   };
+  // Stream/channel aren't user-configurable - preserve the existing camera's values on
+  // edit (defaults apply server-side for a new camera).
+  if (editingCamera) {
+    body.stream = editingCamera.stream;
+    body.channel = editingCamera.channel;
+  }
   var onvifPort = document.getElementById('f_onvif_port').value;
   if (onvifPort) { body.onvif_port = parseInt(onvifPort, 10); }
 
@@ -796,6 +882,7 @@ function restartNow() {
 
 document.getElementById('addBtn').addEventListener('click', function() { openForm(null); });
 document.getElementById('cancelBtn').addEventListener('click', closeForm);
+document.getElementById('f_battery_camera').addEventListener('change', updatePauseVisibility);
 document.getElementById('saveBtn').addEventListener('click', saveCamera);
 document.getElementById('restartBtn').addEventListener('click', restartNow);
 document.getElementById('closeEventsBtn').addEventListener('click', closeEvents);
@@ -807,7 +894,9 @@ document.querySelectorAll('[data-preset]').forEach(function(btn) {
 
 loadSettings();
 refresh();
+refreshServerStats();
 setInterval(refresh, 3000);
+setInterval(refreshServerStats, 5000);
 </script>
 </body>
 </html>

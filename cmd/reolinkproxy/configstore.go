@@ -100,7 +100,10 @@ func (s *ConfigStore) AddCamera(cam CameraConfig, onvifBasePort int) (CameraConf
 
 // UpdateCamera replaces the named camera's fields and persists the change. If the update
 // leaves ONVIFPort/ONVIFMAC/ONVIFSerial unset, the existing values are kept so editing e.g.
-// a password doesn't silently reassign identity Protect has already adopted.
+// a password doesn't silently reassign identity Protect has already adopted. Stream/Channel
+// are always kept from the existing record regardless of what the update carries - they
+// aren't exposed as editable in the web UI (getting them wrong silently drops a stream
+// tier, e.g. Low/Sub), so a caller has no legitimate way to change them through this path.
 func (s *ConfigStore) UpdateCamera(name string, updated CameraConfig, onvifBasePort int) (CameraConfig, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -125,6 +128,8 @@ func (s *ConfigStore) UpdateCamera(name string, updated CameraConfig, onvifBaseP
 	if updated.ONVIFSerial == "" {
 		updated.ONVIFSerial = s.cfg.Cameras[idx].ONVIFSerial
 	}
+	updated.Stream = s.cfg.Cameras[idx].Stream
+	updated.Channel = s.cfg.Cameras[idx].Channel
 
 	applyCameraDefaults(&updated, idx, onvifBasePort)
 	if err := validateCameraConfig(&updated); err != nil {

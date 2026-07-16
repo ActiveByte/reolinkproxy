@@ -80,7 +80,7 @@ func TestLoadCamerasFromEntries(t *testing.T) {
 	if cameras[1].UID != "9527000000000000" {
 		t.Fatalf("unexpected second camera uid: %q", cameras[1].UID)
 	}
-	if cameras[1].Stream != "main" {
+	if cameras[1].Stream != "main,sub" {
 		t.Fatalf("unexpected second camera default stream: %q", cameras[1].Stream)
 	}
 	if cameras[1].RTSPPath != "garage/stream" {
