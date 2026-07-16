@@ -382,6 +382,7 @@ func runCameraEventForwarder(ctx context.Context, cameraName string, client *cam
 
 			caps, err := client.getCapabilities(ctx)
 			if err != nil {
+				broker.SetForwarderSubscribed(false)
 				log.Warnf("camera onvif forwarder %s: get capabilities failed: %v, retrying in 30s", cameraName, err)
 				if !sleepOrDone(ctx, 30*time.Second) {
 					return
@@ -391,6 +392,7 @@ func runCameraEventForwarder(ctx context.Context, cameraName string, client *cam
 
 			subAddr, err := client.createPullPointSubscription(ctx, caps.EventsXAddr)
 			if err != nil {
+				broker.SetForwarderSubscribed(false)
 				log.Warnf("camera onvif forwarder %s: create subscription failed: %v, retrying in 30s", cameraName, err)
 				if !sleepOrDone(ctx, 30*time.Second) {
 					return
@@ -398,6 +400,7 @@ func runCameraEventForwarder(ctx context.Context, cameraName string, client *cam
 				continue
 			}
 
+			broker.SetForwarderSubscribed(true)
 			log.Printf("camera onvif forwarder %s: subscribed to camera's own onvif events at %s", cameraName, caps.EventsXAddr)
 
 			for ctx.Err() == nil {
@@ -409,7 +412,20 @@ func runCameraEventForwarder(ctx context.Context, cameraName string, client *cam
 				// embedded ONVIF stack than fixing a TTL race. Reverted to 20s.
 				events, err := client.pullMessages(ctx, subAddr, 20*time.Second, 20)
 				if err != nil {
-					log.Warnf("camera onvif forwarder %s: pull failed: %v, resubscribing in 10s", cameraName, err)
+					// The subscription itself is usually still valid after one of these
+					// transient empty-reason faults - retry once on the SAME subscription
+					// before paying for a full resubscribe, which can make the camera
+					// resend its whole "Initialized" event burst (see the http.Client
+					// comment above).
+					log.Warnf("camera onvif forwarder %s: pull failed: %v, retrying same subscription in 2s", cameraName, err)
+					if !sleepOrDone(ctx, 2*time.Second) {
+						return
+					}
+					events, err = client.pullMessages(ctx, subAddr, 20*time.Second, 20)
+				}
+				if err != nil {
+					broker.SetForwarderSubscribed(false)
+					log.Warnf("camera onvif forwarder %s: pull failed again: %v, resubscribing in 10s", cameraName, err)
 					if !sleepOrDone(ctx, 10*time.Second) {
 						return
 					}

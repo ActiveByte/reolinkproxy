@@ -2,113 +2,10 @@ package main
 
 import (
 	"fmt"
-	"strings"
+	"os"
+	"path/filepath"
 	"testing"
-	"time"
 )
-
-func TestLoadCamerasFromEntries(t *testing.T) {
-	t.Parallel()
-
-	cameras, err := loadCamerasFromEntries([]string{
-		"REOLINK_CAMERA_1_NAME=garage",
-		"REOLINK_CAMERA_1_UID=9527000000000000",
-		"REOLINK_CAMERA_1_USERNAME=admin",
-		"REOLINK_CAMERA_1_PASSWORD=secret",
-		"REOLINK_CAMERA_0_NAME=front",
-		"REOLINK_CAMERA_0_HOST=192.168.1.10",
-		"REOLINK_CAMERA_0_TIMEOUT=15s",
-		"REOLINK_CAMERA_0_RTSP_PATH=front/custom",
-		"REOLINK_CAMERA_0_STREAM=main,sub",
-		"REOLINK_CAMERA_0_TALK_PROFILE=sub",
-		"REOLINK_CAMERA_0_CHANNEL=1",
-		"REOLINK_CAMERA_0_PAUSE_ON_MOTION=true",
-		"REOLINK_CAMERA_0_PAUSE_ON_CLIENT=true",
-		"REOLINK_CAMERA_0_PAUSE_TIMEOUT=3s",
-		"REOLINK_CAMERA_0_IDLE_DISCONNECT=true",
-		"REOLINK_CAMERA_0_IDLE_TIMEOUT=45s",
-		"UNRELATED_KEY=value",
-	})
-	if err != nil {
-		t.Fatalf("loadCamerasFromEntries returned error: %v", err)
-	}
-
-	if len(cameras) != 2 {
-		t.Fatalf("expected 2 cameras, got %d", len(cameras))
-	}
-
-	if cameras[0].Name != "front" {
-		t.Fatalf("unexpected first camera name: %q", cameras[0].Name)
-	}
-	if cameras[0].Host != "192.168.1.10" {
-		t.Fatalf("unexpected first camera host: %q", cameras[0].Host)
-	}
-	if cameras[0].Port != 9000 {
-		t.Fatalf("unexpected first camera default port: %d", cameras[0].Port)
-	}
-	if cameras[0].Timeout != 15*time.Second {
-		t.Fatalf("unexpected first camera timeout: %v", cameras[0].Timeout)
-	}
-	if cameras[0].RTSPPath != "front/custom" {
-		t.Fatalf("unexpected first camera rtsp path: %q", cameras[0].RTSPPath)
-	}
-	if cameras[0].TalkProfile != "sub" {
-		t.Fatalf("unexpected first camera talk profile: %q", cameras[0].TalkProfile)
-	}
-	if cameras[0].Channel != 1 {
-		t.Fatalf("unexpected first camera channel: %d", cameras[0].Channel)
-	}
-	if !cameras[0].PauseOnMotion {
-		t.Fatal("expected first camera pause_on_motion to be true")
-	}
-	if !cameras[0].PauseOnClient {
-		t.Fatal("expected first camera pause_on_client to be true")
-	}
-	if cameras[0].PauseTimeout != 3*time.Second {
-		t.Fatalf("unexpected first camera pause timeout: %v", cameras[0].PauseTimeout)
-	}
-	if !cameras[0].IdleDisconnect {
-		t.Fatal("expected first camera idle_disconnect to be true")
-	}
-	if cameras[0].IdleTimeout != 45*time.Second {
-		t.Fatalf("unexpected first camera idle timeout: %v", cameras[0].IdleTimeout)
-	}
-
-	if cameras[1].Name != "garage" {
-		t.Fatalf("unexpected second camera name: %q", cameras[1].Name)
-	}
-	if cameras[1].UID != "9527000000000000" {
-		t.Fatalf("unexpected second camera uid: %q", cameras[1].UID)
-	}
-	if cameras[1].Stream != "main,sub" {
-		t.Fatalf("unexpected second camera default stream: %q", cameras[1].Stream)
-	}
-	if cameras[1].RTSPPath != "garage/stream" {
-		t.Fatalf("unexpected second camera default rtsp path: %q", cameras[1].RTSPPath)
-	}
-	if cameras[1].TalkEncoder != "internal" {
-		t.Fatalf("unexpected second camera default talk encoder: %q", cameras[1].TalkEncoder)
-	}
-
-	if cameras[0].ONVIFPort == 0 || cameras[1].ONVIFPort == 0 {
-		t.Fatal("expected both cameras to get a default onvif port")
-	}
-	if cameras[0].ONVIFPort == cameras[1].ONVIFPort {
-		t.Fatalf("expected distinct default onvif ports, both got %d", cameras[0].ONVIFPort)
-	}
-	if cameras[0].ONVIFMAC == "" || cameras[1].ONVIFMAC == "" {
-		t.Fatal("expected both cameras to get a default onvif mac")
-	}
-	if cameras[0].ONVIFMAC == cameras[1].ONVIFMAC {
-		t.Fatalf("expected distinct default onvif macs for differently-named cameras, both got %q", cameras[0].ONVIFMAC)
-	}
-	if cameras[0].ONVIFSerial == "" || cameras[1].ONVIFSerial == "" {
-		t.Fatal("expected both cameras to get a default onvif serial")
-	}
-	if cameras[0].ONVIFSerial == cameras[1].ONVIFSerial {
-		t.Fatalf("expected distinct default onvif serials, both got %q", cameras[0].ONVIFSerial)
-	}
-}
 
 func TestDeriveFakeMACIsStableAndLocallyAdministered(t *testing.T) {
 	t.Parallel()
@@ -160,68 +57,71 @@ func TestApplyCameraDefaultsHonorsExplicitONVIFOverrides(t *testing.T) {
 	}
 }
 
-func TestApplyCameraDefaultsBatteryCameraDoesNotEnableIdleDisconnect(t *testing.T) {
+func TestLoadCamerasFromConfigFileReadsCamerasAndTreatsMissingFileAsEmpty(t *testing.T) {
 	t.Parallel()
 
-	camera := CameraConfig{
-		Name:          "front",
-		Host:          "192.168.1.10",
-		BatteryCamera: true,
+	path := filepath.Join(t.TempDir(), "config.yml")
+
+	cameras, err := loadCamerasFromConfigFile(path)
+	if err != nil {
+		t.Fatalf("expected a missing config file to be treated as no cameras, got error: %v", err)
+	}
+	if cameras != nil {
+		t.Fatalf("expected no cameras for a missing file, got %+v", cameras)
 	}
 
-	applyCameraDefaults(&camera, 0, 8102)
-
-	if camera.IdleDisconnect {
-		t.Fatal("expected battery camera not to enable idle_disconnect automatically")
+	yamlDoc := "cameras:\n  - name: front\n    host: 192.168.1.10\n    rtsp_path: front/stream\n"
+	if err := os.WriteFile(path, []byte(yamlDoc), 0o600); err != nil {
+		t.Fatalf("write config file: %v", err)
 	}
-	if camera.IdleTimeout != 30*time.Second {
-		t.Fatalf("unexpected default idle timeout: %v", camera.IdleTimeout)
+
+	cameras, err = loadCamerasFromConfigFile(path)
+	if err != nil {
+		t.Fatalf("loadCamerasFromConfigFile: %v", err)
+	}
+	if len(cameras) != 1 || cameras[0].Name != "front" {
+		t.Fatalf("expected one camera named front, got %+v", cameras)
 	}
 }
 
-func TestLoadCamerasFromEntriesReturnsValidationError(t *testing.T) {
+func TestMergeServerDefaultsFillsZeroValuedFieldsOnly(t *testing.T) {
 	t.Parallel()
 
-	_, err := loadCamerasFromEntries([]string{
-		"REOLINK_CAMERA_2_NAME=front",
-	})
-	if err == nil {
-		t.Fatal("expected validation error")
+	file := ServerConfig{
+		RTSPAddress:   ":9554", // explicitly set in config.yml - must survive
+		ONVIFBasePort: 9102,    // explicitly set in config.yml - must survive
+		// RTPAddress, RTCPAddress, LogLevel, pacer settings, ConfigFile, WebAddress:
+		// left zero, as if config.yml predates these fields or never persists them.
 	}
-	if !strings.Contains(err.Error(), "REOLINK_CAMERA_2_*") {
-		t.Fatalf("unexpected error: %v", err)
+	fallback := defaultConfig().Server
+	fallback.ConfigFile = "/config.yml"
+	fallback.WebAddress = ":8080"
+
+	merged := mergeServerDefaults(file, fallback)
+
+	if merged.RTSPAddress != ":9554" {
+		t.Fatalf("expected explicit file value to survive, got %q", merged.RTSPAddress)
+	}
+	if merged.ONVIFBasePort != 9102 {
+		t.Fatalf("expected explicit file value to survive, got %d", merged.ONVIFBasePort)
+	}
+	if merged.RTPAddress != fallback.RTPAddress {
+		t.Fatalf("expected zero-valued rtp_address to fall back to %q, got %q", fallback.RTPAddress, merged.RTPAddress)
+	}
+	if merged.RTCPAddress != fallback.RTCPAddress {
+		t.Fatalf("expected zero-valued rtcp_address to fall back to %q, got %q", fallback.RTCPAddress, merged.RTCPAddress)
+	}
+	if merged.LogLevel != fallback.LogLevel {
+		t.Fatalf("expected zero-valued log_level to fall back to %q, got %q", fallback.LogLevel, merged.LogLevel)
+	}
+	if merged.VideoPacerInitialLatencyMs != fallback.VideoPacerInitialLatencyMs {
+		t.Fatalf("expected zero-valued video pacer latency to fall back to %d, got %d", fallback.VideoPacerInitialLatencyMs, merged.VideoPacerInitialLatencyMs)
+	}
+	if merged.ConfigFile != "/config.yml" {
+		t.Fatalf("expected ConfigFile to always come from CLI/env, got %q", merged.ConfigFile)
+	}
+	if merged.WebAddress != ":8080" {
+		t.Fatalf("expected WebAddress to always come from CLI/env, got %q", merged.WebAddress)
 	}
 }
 
-func TestLoadCamerasFromEntriesRejectsInvalidTalkProfile(t *testing.T) {
-	t.Parallel()
-
-	_, err := loadCamerasFromEntries([]string{
-		"REOLINK_CAMERA_0_NAME=front",
-		"REOLINK_CAMERA_0_HOST=192.168.1.10",
-		"REOLINK_CAMERA_0_STREAM=main,sub",
-		"REOLINK_CAMERA_0_TALK_PROFILE=extern",
-	})
-	if err == nil {
-		t.Fatal("expected validation error")
-	}
-	if !strings.Contains(err.Error(), "talk_profile") {
-		t.Fatalf("unexpected error: %v", err)
-	}
-}
-
-func TestLoadCamerasFromEntriesReturnsParseError(t *testing.T) {
-	t.Parallel()
-
-	_, err := loadCamerasFromEntries([]string{
-		"REOLINK_CAMERA_0_NAME=front",
-		"REOLINK_CAMERA_0_HOST=192.168.1.10",
-		"REOLINK_CAMERA_0_TIMEOUT=not-a-duration",
-	})
-	if err == nil {
-		t.Fatal("expected parse error")
-	}
-	if !strings.Contains(err.Error(), "REOLINK_CAMERA_0_TIMEOUT") {
-		t.Fatalf("unexpected error: %v", err)
-	}
-}

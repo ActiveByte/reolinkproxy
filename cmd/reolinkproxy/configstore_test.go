@@ -164,28 +164,3 @@ func TestConfigStoreHealsLegacyStreamValueOnLoad(t *testing.T) {
 	}
 }
 
-func TestConfigStoreReplaceCamerasIfEmptyOnlyAppliesOnce(t *testing.T) {
-	t.Parallel()
-
-	path := filepath.Join(t.TempDir(), "config.yml")
-	store, err := newConfigStore(path, Config{})
-	if err != nil {
-		t.Fatalf("newConfigStore: %v", err)
-	}
-
-	if err := store.ReplaceCamerasIfEmpty([]CameraConfig{{Name: "env-cam", Host: "10.0.0.5"}}, 8102); err != nil {
-		t.Fatalf("ReplaceCamerasIfEmpty: %v", err)
-	}
-	if len(store.Cameras()) != 1 {
-		t.Fatalf("expected env bootstrap to seed one camera, got %d", len(store.Cameras()))
-	}
-
-	// A second bootstrap attempt (e.g. next process start with the same env vars) must not
-	// override cameras that have since been edited via the store/web UI.
-	if err := store.ReplaceCamerasIfEmpty([]CameraConfig{{Name: "other", Host: "10.0.0.6"}}, 8102); err != nil {
-		t.Fatalf("ReplaceCamerasIfEmpty (second call): %v", err)
-	}
-	if len(store.Cameras()) != 1 || store.Cameras()[0].Name != "env-cam" {
-		t.Fatalf("expected first bootstrap to stick, got %+v", store.Cameras())
-	}
-}

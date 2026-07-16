@@ -66,9 +66,9 @@ func newHealthcheckCommand() *cli.Command {
 
 			paths := splitHealthcheckPaths(rawPaths)
 			if len(paths) == 0 {
-				cameras, err := loadCamerasFromEnv()
+				cameras, err := loadCamerasFromConfigFile(cfg.Server.ConfigFile)
 				if err != nil {
-					return fmt.Errorf("load cameras from environment: %w", err)
+					return fmt.Errorf("load cameras from config file: %w", err)
 				}
 				paths = healthcheckPathsForCameras(cameras)
 			}

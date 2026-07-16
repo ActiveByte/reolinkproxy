@@ -3,14 +3,13 @@ package main
 import (
 	"crypto/sha1" //#nosec G505
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
-	"reflect"
-	"regexp"
-	"sort"
-	"strconv"
 	"strings"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 type Config struct {
@@ -28,21 +27,17 @@ type MQTTConfig struct {
 }
 
 type ServerConfig struct {
-	RTSPAddress   string `yaml:"rtsp_address"`
-	RTPAddress    string `yaml:"rtp_address"`
-	RTCPAddress   string `yaml:"rtcp_address"`
-	ONVIFAddress  string `yaml:"onvif_address"`
+	RTSPAddress string `yaml:"rtsp_address"`
+	RTPAddress  string `yaml:"rtp_address"`
+	RTCPAddress string `yaml:"rtcp_address"`
 	// ONVIFBasePort is the first port used to auto-assign per-camera ONVIF services when a
-	// camera doesn't set ONVIFPort explicitly (base port + camera index).
-	ONVIFBasePort int    `yaml:"onvif_base_port"`
+	// camera doesn't set ONVIFPort explicitly (base port + camera index). Each camera gets
+	// its own ONVIF server on its own port - there is no single shared ONVIF address.
+	ONVIFBasePort int `yaml:"onvif_base_port"`
 	PprofAddress  string `yaml:"pprof_address"`
 	AdvertiseHost string `yaml:"advertise_host"`
 	LogLevel      string `yaml:"log_level"`
 	LogPackets    bool   `yaml:"log_packets"`
-	// ProtectServerIP is the expected IP address of the UniFi Protect (or other NVR) host.
-	// When set, the web UI highlights whether RTSP/ONVIF connections are actually arriving
-	// from this address, to make it visible whether Protect is really talking to a camera.
-	ProtectServerIP string `yaml:"protect_server_ip" json:"protect_server_ip"`
 
 	// AudioPacerInitialLatencyMs is the media pacer startup delay for audio (wall clock before
 	// the first packet is sent). Default 500ms.
@@ -97,7 +92,6 @@ type CameraConfig struct {
 	PauseTimeout   time.Duration `yaml:"pause_timeout" json:"pause_timeout"`
 	IdleDisconnect bool          `yaml:"idle_disconnect" json:"idle_disconnect"`
 	IdleTimeout    time.Duration `yaml:"idle_timeout" json:"idle_timeout"`
-	BatteryCamera  bool          `yaml:"battery_camera" json:"battery_camera"`
 	// SubUsesExtern, when true, serves the "sub" stream role (RTSP path, ONVIF Low
 	// profile) from the camera's Baichuan Extern channel instead of its Sub channel. Some
 	// models' Extern encoder profile is a distinct, more stable tier than Sub - this only
@@ -125,12 +119,6 @@ type CameraConfig struct {
 	CameraONVIFPort int `yaml:"camera_onvif_port" json:"camera_onvif_port"`
 }
 
-var (
-	cameraEnvKeyRE   = regexp.MustCompile(`^REOLINK_CAMERA_(\d+)_([A-Z0-9_]+)$`)
-	cameraConfigType = reflect.TypeOf(CameraConfig{})
-	durationType     = reflect.TypeOf(time.Duration(0))
-)
-
 func (c ServerConfig) audioPacerInitialLatency() time.Duration {
 	return time.Duration(c.AudioPacerInitialLatencyMs) * time.Millisecond
 }
@@ -153,7 +141,6 @@ func defaultConfig() *Config {
 			RTSPAddress:                ":8554",
 			RTPAddress:                 ":8000",
 			RTCPAddress:                ":8001",
-			ONVIFAddress:               ":8002",
 			ONVIFBasePort:              8102,
 			PprofAddress:               "",
 			LogLevel:                   "info",
@@ -173,118 +160,64 @@ func defaultConfig() *Config {
 	}
 }
 
-func loadCamerasFromEnv() ([]CameraConfig, error) {
-	return loadCamerasFromEntries(os.Environ())
-}
-
-func loadCamerasFromEntries(entries []string) ([]CameraConfig, error) {
-	fieldIndexes := cameraEnvFieldIndexes()
-	camerasByIndex := make(map[int]*CameraConfig)
-
-	for _, entry := range entries {
-		key, value, ok := strings.Cut(entry, "=")
-		if !ok {
-			continue
-		}
-
-		matches := cameraEnvKeyRE.FindStringSubmatch(key)
-		if len(matches) != 3 {
-			continue
-		}
-
-		cameraIndex, err := strconv.Atoi(matches[1])
-		if err != nil {
-			return nil, fmt.Errorf("%s: invalid camera index: %w", key, err)
-		}
-
-		fieldIndex, found := fieldIndexes[matches[2]]
-		if !found {
-			continue
-		}
-
-		camera := camerasByIndex[cameraIndex]
-		if camera == nil {
-			camera = &CameraConfig{}
-			camerasByIndex[cameraIndex] = camera
-		}
-
-		field := reflect.ValueOf(camera).Elem().Field(fieldIndex)
-		if err := setFieldFromEnv(field, value, key); err != nil {
-			return nil, err
-		}
-	}
-
-	if len(camerasByIndex) == 0 {
+// loadCamerasFromConfigFile reads just the camera list out of the YAML config file, for the
+// healthcheck subcommand's path-discovery fallback - it runs as a separate short-lived
+// process (typically Docker's HEALTHCHECK), so it reads the file directly rather than going
+// through ConfigStore (which would create the file if missing, a side effect a read-only
+// health probe shouldn't have).
+func loadCamerasFromConfigFile(path string) ([]CameraConfig, error) {
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
 	}
-
-	indexes := make([]int, 0, len(camerasByIndex))
-	for cameraIndex := range camerasByIndex {
-		indexes = append(indexes, cameraIndex)
-	}
-	sort.Ints(indexes)
-
-	cameras := make([]CameraConfig, 0, len(indexes))
-	for i, cameraIndex := range indexes {
-		camera := *camerasByIndex[cameraIndex]
-		applyCameraDefaults(&camera, i, defaultConfig().Server.ONVIFBasePort)
-
-		if err := validateCameraConfig(&camera); err != nil {
-			return nil, fmt.Errorf("REOLINK_CAMERA_%d_*: %w", cameraIndex, err)
-		}
-
-		cameras = append(cameras, camera)
+	if err != nil {
+		return nil, fmt.Errorf("read config file %s: %w", path, err)
 	}
 
-	return cameras, nil
+	var fileCfg Config
+	if err := yaml.Unmarshal(data, &fileCfg); err != nil {
+		return nil, fmt.Errorf("parse config file %s: %w", path, err)
+	}
+	return fileCfg.Cameras, nil
 }
 
-func cameraEnvFieldIndexes() map[string]int {
-	out := make(map[string]int, cameraConfigType.NumField())
-
-	for i := range cameraConfigType.NumField() {
-		tag := strings.Split(cameraConfigType.Field(i).Tag.Get("yaml"), ",")[0]
-		// stream is not user-configurable (see applyCameraDefaults); skip it so
-		// REOLINK_CAMERA_<n>_STREAM is silently ignored rather than accepted and discarded.
-		if tag == "" || tag == "-" || tag == "stream" {
-			continue
-		}
-		out[strings.ToUpper(tag)] = i
+// mergeServerDefaults fills any zero-valued field in file with the corresponding value from
+// fallback (the CLI/env-resolved config), so a config.yml that predates a field - or the
+// ConfigFile/WebAddress fields, which are never persisted (see their yaml:"-" tags) - still
+// ends up correct after loading. Bool fields are intentionally left alone: a missing field
+// and an explicit false are indistinguishable in YAML, and their real default is already
+// baked into the file the first time it's written (see newConfigStore).
+func mergeServerDefaults(file, fallback ServerConfig) ServerConfig {
+	if file.RTSPAddress == "" {
+		file.RTSPAddress = fallback.RTSPAddress
 	}
-
-	return out
-}
-
-func setFieldFromEnv(field reflect.Value, rawValue string, envKey string) error {
-	if field.Type() == durationType {
-		duration, err := time.ParseDuration(rawValue)
-		if err != nil {
-			return fmt.Errorf("%s: invalid duration %q", envKey, rawValue)
-		}
-		field.SetInt(int64(duration))
-		return nil
+	if file.RTPAddress == "" {
+		file.RTPAddress = fallback.RTPAddress
 	}
-
-	switch field.Kind() {
-	case reflect.String:
-		field.SetString(rawValue)
-	case reflect.Bool:
-		value, err := strconv.ParseBool(rawValue)
-		if err != nil {
-			return fmt.Errorf("%s: invalid bool %q", envKey, rawValue)
-		}
-		field.SetBool(value)
-	case reflect.Int:
-		value, err := strconv.Atoi(rawValue)
-		if err != nil {
-			return fmt.Errorf("%s: invalid int %q", envKey, rawValue)
-		}
-		field.SetInt(int64(value))
-	default:
-		return fmt.Errorf("%s: unsupported field type %s", envKey, field.Type())
+	if file.RTCPAddress == "" {
+		file.RTCPAddress = fallback.RTCPAddress
 	}
-
-	return nil
+	if file.ONVIFBasePort == 0 {
+		file.ONVIFBasePort = fallback.ONVIFBasePort
+	}
+	if file.LogLevel == "" {
+		file.LogLevel = fallback.LogLevel
+	}
+	if file.AudioPacerInitialLatencyMs == 0 {
+		file.AudioPacerInitialLatencyMs = fallback.AudioPacerInitialLatencyMs
+	}
+	if file.AudioPacerMaxLeadMs == 0 {
+		file.AudioPacerMaxLeadMs = fallback.AudioPacerMaxLeadMs
+	}
+	if file.VideoPacerInitialLatencyMs == 0 {
+		file.VideoPacerInitialLatencyMs = fallback.VideoPacerInitialLatencyMs
+	}
+	if file.VideoPacerMaxLeadMs == 0 {
+		file.VideoPacerMaxLeadMs = fallback.VideoPacerMaxLeadMs
+	}
+	file.ConfigFile = fallback.ConfigFile
+	file.WebAddress = fallback.WebAddress
+	return file
 }
 
 func applyCameraDefaults(camera *CameraConfig, index int, onvifBasePort int) {

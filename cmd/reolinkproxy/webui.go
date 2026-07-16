@@ -7,7 +7,7 @@ import (
 	"net/http"
 	"runtime"
 	"sort"
-	"strings"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -51,11 +51,12 @@ func (r *statusRegistry) register(cs *cameraStatus) {
 }
 
 type streamStatusView struct {
-	Path   string `json:"path"`
-	Width  uint32 `json:"width"`
-	Height uint32 `json:"height"`
-	FPS    uint8  `json:"fps"`
-	Codec  string `json:"codec"`
+	Path        string  `json:"path"`
+	Width       uint32  `json:"width"`
+	Height      uint32  `json:"height"`
+	FPS         uint8   `json:"fps"`
+	Codec       string  `json:"codec"`
+	BitrateKbps float64 `json:"bitrate_kbps"`
 }
 
 type motionStatusView struct {
@@ -81,29 +82,32 @@ type subscriberView struct {
 }
 
 type cameraStatusView struct {
-	Name                string           `json:"name"`
-	Host                string           `json:"host"`
-	Connected           bool             `json:"connected"`
-	ONVIFPort           int              `json:"onvif_port"`
-	ONVIFMAC            string           `json:"onvif_mac"`
-	ONVIFSerial         string           `json:"onvif_serial"`
-	ONVIFAuthority      string           `json:"onvif_authority"`
-	EventSubscribers    int              `json:"event_subscribers"`
-	EventSubscriberList []subscriberView `json:"event_subscriber_list"`
-	RTSPClients         []clientView     `json:"rtsp_clients"`
-	// ProtectConnected is true when protectIP (the configured NVR IP passed to snapshot) has
-	// an active RTSP client or ONVIF event subscription against this camera right now.
-	ProtectConnected bool               `json:"protect_connected"`
-	Streams          []streamStatusView `json:"streams"`
-	Motion           motionStatusView   `json:"motion"`
+	Name                string             `json:"name"`
+	Host                string             `json:"host"`
+	Connected           bool               `json:"connected"`
+	ONVIFPort           int                `json:"onvif_port"`
+	ONVIFMAC            string             `json:"onvif_mac"`
+	ONVIFSerial         string             `json:"onvif_serial"`
+	ONVIFAuthority      string             `json:"onvif_authority"`
+	EventSubscribers    int                `json:"event_subscribers"`
+	EventSubscriberList []subscriberView   `json:"event_subscriber_list"`
+	RTSPClients         []clientView       `json:"rtsp_clients"`
+	Streams             []streamStatusView `json:"streams"`
+	Motion              motionStatusView   `json:"motion"`
+	// Reconnects/LastError help spot an unstable Baichuan connection (e.g. flaky WiFi) at a
+	// glance, without needing to dig through the log viewer.
+	Reconnects int    `json:"reconnects"`
+	LastError  string `json:"last_error"`
+	// EventForwarderUp is true when we currently have a live PullPoint subscription against
+	// the camera's own ONVIF events service - i.e. we're actually able to receive its real
+	// motion/smart-detection events right now, not just serve downstream NVR subscribers.
+	EventForwarderUp bool `json:"event_forwarder_up"`
+	// Events24h is how many events (real + test) this camera has broadcast in the last 24h.
+	Events24h int `json:"events_24h"`
 }
 
-// snapshot builds the current status view for every registered camera. protectIP, if set, is
-// compared (host-only, ignoring source port) against every RTSP client and ONVIF event
-// subscriber IP to populate ProtectConnected - letting the UI show whether the configured NVR
-// is actually talking to a given camera right now, not just whether the camera itself is
-// reachable.
-func (r *statusRegistry) snapshot(protectIP string) []cameraStatusView {
+// snapshot builds the current status view for every registered camera.
+func (r *statusRegistry) snapshot() []cameraStatusView {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
@@ -126,9 +130,14 @@ func (r *statusRegistry) snapshot(protectIP string) []cameraStatusView {
 		}
 		if cs.device != nil {
 			view.Connected = cs.device.Connected()
+			stats := cs.device.Stats()
+			view.Reconnects = stats.Reconnects
+			view.LastError = stats.LastError
 		}
 		if cs.events != nil {
 			view.EventSubscribers = cs.events.SubscriberCount()
+			view.EventForwarderUp, _ = cs.events.ForwarderStatus()
+			view.Events24h = cs.events.Count24h()
 			for _, sub := range cs.events.Subscribers() {
 				view.EventSubscriberList = append(view.EventSubscriberList, subscriberView{
 					IP:        hostOnly(sub.RemoteAddr),
@@ -141,11 +150,12 @@ func (r *statusRegistry) snapshot(protectIP string) []cameraStatusView {
 		for _, m := range cs.metas {
 			snap := m.snapshot()
 			view.Streams = append(view.Streams, streamStatusView{
-				Path:   snap.Path,
-				Width:  snap.Width,
-				Height: snap.Height,
-				FPS:    snap.FPS,
-				Codec:  snap.VideoCodec,
+				Path:        snap.Path,
+				Width:       snap.Width,
+				Height:      snap.Height,
+				FPS:         snap.FPS,
+				Codec:       snap.VideoCodec,
+				BitrateKbps: snap.BitrateKbps,
 			})
 			if r.rtspServer == nil {
 				continue
@@ -167,18 +177,6 @@ func (r *statusRegistry) snapshot(protectIP string) []cameraStatusView {
 		if cs.motion != nil {
 			snap := cs.motion.snapshotCopy()
 			view.Motion = motionStatusView{Known: snap.Known, Active: snap.Active, Unsupported: snap.Unsupported}
-		}
-		if protectIP != "" {
-			for _, c := range view.RTSPClients {
-				if c.IP == protectIP {
-					view.ProtectConnected = true
-				}
-			}
-			for _, s := range view.EventSubscriberList {
-				if s.IP == protectIP {
-					view.ProtectConnected = true
-				}
-			}
 		}
 		views = append(views, view)
 	}
@@ -215,8 +213,9 @@ func newWebUIHandler(store *ConfigStore, status *statusRegistry, onvifBasePort i
 	mux.HandleFunc("GET /", h.handleIndex)
 	mux.HandleFunc("GET /api/status", h.handleStatus)
 	mux.HandleFunc("GET /api/server-stats", h.handleServerStats)
-	mux.HandleFunc("GET /api/settings", h.handleGetSettings)
-	mux.HandleFunc("PUT /api/settings", h.handleUpdateSettings)
+	mux.HandleFunc("GET /api/logs", h.handleLogs)
+	mux.HandleFunc("GET /api/logs/level", h.handleGetLogLevel)
+	mux.HandleFunc("PUT /api/logs/level", h.handleSetLogLevel)
 	mux.HandleFunc("GET /api/cameras", h.handleListCameras)
 	mux.HandleFunc("POST /api/cameras", h.handleCreateCamera)
 	mux.HandleFunc("PUT /api/cameras/{name}", h.handleUpdateCamera)
@@ -285,58 +284,90 @@ func (h *webUIServer) handleIndex(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *webUIServer) handleStatus(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, h.status.snapshot(h.store.ProtectServerIP()))
+	writeJSON(w, http.StatusOK, h.status.snapshot())
 }
 
 type serverStatsView struct {
-	UptimeSeconds int64   `json:"uptime_seconds"`
-	Goroutines    int     `json:"goroutines"`
-	MemAllocMB    float64 `json:"mem_alloc_mb"`
-	MemSysMB      float64 `json:"mem_sys_mb"`
-	NumGC         uint32  `json:"num_gc"`
-	GoVersion     string  `json:"go_version"`
-	NumCPU        int     `json:"num_cpu"`
-	NumCameras    int     `json:"num_cameras"`
+	UptimeSeconds  int64   `json:"uptime_seconds"`
+	Goroutines     int     `json:"goroutines"`
+	MemAllocMB     float64 `json:"mem_alloc_mb"`
+	MemSysMB       float64 `json:"mem_sys_mb"`
+	NumGC          uint32  `json:"num_gc"`
+	GoVersion      string  `json:"go_version"`
+	NumCPU         int     `json:"num_cpu"`
+	NumCameras     int     `json:"num_cameras"`
+	TotalClients   int     `json:"total_clients"`
+	TotalBitrateKb float64 `json:"total_bitrate_kbps"`
 }
 
 func (h *webUIServer) handleServerStats(w http.ResponseWriter, _ *http.Request) {
 	var mem runtime.MemStats
 	runtime.ReadMemStats(&mem)
 
+	totalClients := 0
+	var totalBitrate float64
+	for _, cam := range h.status.snapshot() {
+		totalClients += len(cam.RTSPClients)
+		for _, s := range cam.Streams {
+			totalBitrate += s.BitrateKbps
+		}
+	}
+
 	writeJSON(w, http.StatusOK, serverStatsView{
-		UptimeSeconds: int64(time.Since(processStartTime).Seconds()),
-		Goroutines:    runtime.NumGoroutine(),
-		MemAllocMB:    float64(mem.Alloc) / (1024 * 1024),
-		MemSysMB:      float64(mem.Sys) / (1024 * 1024),
-		NumGC:         mem.NumGC,
-		GoVersion:     runtime.Version(),
-		NumCPU:        runtime.NumCPU(),
-		NumCameras:    len(h.store.Cameras()),
+		UptimeSeconds:  int64(time.Since(processStartTime).Seconds()),
+		Goroutines:     runtime.NumGoroutine(),
+		MemAllocMB:     float64(mem.Alloc) / (1024 * 1024),
+		MemSysMB:       float64(mem.Sys) / (1024 * 1024),
+		NumGC:          mem.NumGC,
+		GoVersion:      runtime.Version(),
+		NumCPU:         runtime.NumCPU(),
+		NumCameras:     len(h.store.Cameras()),
+		TotalClients:   totalClients,
+		TotalBitrateKb: totalBitrate,
 	})
 }
 
-type settingsView struct {
-	ProtectServerIP string `json:"protect_server_ip"`
+// handleLogs returns recent buffered log lines (newest last), for checking what happened
+// without needing filesystem/docker-logs access - the main debugging tool on a headless
+// deployment. ?limit=N caps how many lines to return (default/max 2000, the buffer's own
+// capacity).
+func (h *webUIServer) handleLogs(w http.ResponseWriter, r *http.Request) {
+	limit := 500
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	writeJSON(w, http.StatusOK, logsView{Lines: log.RecentLines(limit), Level: log.Level()})
 }
 
-func (h *webUIServer) handleGetSettings(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, settingsView{ProtectServerIP: h.store.ProtectServerIP()})
+type logsView struct {
+	Lines []string `json:"lines"`
+	Level string   `json:"level"`
 }
 
-// handleUpdateSettings takes effect immediately - unlike camera edits it needs no restart,
-// since it's purely informational (the connected/offline indicator), not part of ONVIF/RTSP
-// negotiation.
-func (h *webUIServer) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
-	var req settingsView
+type logLevelView struct {
+	Level string `json:"level"`
+}
+
+func (h *webUIServer) handleGetLogLevel(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, logLevelView{Level: log.Level()})
+}
+
+// handleSetLogLevel changes the log level at runtime (no restart needed), so more detail can
+// be turned on right when something looks wrong instead of needing to restart with a
+// different --server-log-level first and hope the issue reproduces again.
+func (h *webUIServer) handleSetLogLevel(w http.ResponseWriter, r *http.Request) {
+	var req logLevelView
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSONError(w, http.StatusBadRequest, err)
 		return
 	}
-	if err := h.store.SetProtectServerIP(strings.TrimSpace(req.ProtectServerIP)); err != nil {
+	if err := log.SetLevel(req.Level); err != nil {
 		writeJSONError(w, http.StatusBadRequest, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, settingsView{ProtectServerIP: h.store.ProtectServerIP()})
+	writeJSON(w, http.StatusOK, logLevelView{Level: log.Level()})
 }
 
 func (h *webUIServer) handleListCameras(w http.ResponseWriter, _ *http.Request) {
@@ -437,10 +468,19 @@ const indexHTML = `<!doctype html>
   body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 1.5rem; max-width: 1180px; margin-inline: auto; font-size: 13px; }
   h1 { font-size: 1.15rem; margin: 0 0 0.15rem; font-weight: 600; letter-spacing: -0.01em; }
   h3, h4 { font-size: 0.95rem; margin: 0 0 0.6rem; }
-  .sub { color: var(--muted); margin-bottom: 1.1rem; font-size: 0.82rem; }
-  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; }
+  .sub { color: var(--muted); font-size: 0.82rem; }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; margin-bottom: 1.2rem; }
   table { width: 100%; border-collapse: collapse; }
-  th, td { text-align: left; padding: 0.45rem 0.6rem; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th, td { text-align: left; padding: 0.45rem 0.6rem; border-bottom: 1px solid var(--border); vertical-align: top; overflow-wrap: break-word; }
+  #cameraTable { table-layout: fixed; }
+  #cameraTable th:nth-child(1), #cameraTable td:nth-child(1) { width: 8%; }
+  #cameraTable th:nth-child(2), #cameraTable td:nth-child(2) { width: 11%; }
+  #cameraTable th:nth-child(3), #cameraTable td:nth-child(3) { width: 13%; }
+  #cameraTable th:nth-child(4), #cameraTable td:nth-child(4) { width: 18%; }
+  #cameraTable th:nth-child(5), #cameraTable td:nth-child(5) { width: 17%; }
+  #cameraTable th:nth-child(6), #cameraTable td:nth-child(6) { width: 17%; }
+  #cameraTable th:nth-child(7), #cameraTable td:nth-child(7) { width: 6%; }
+  #cameraTable th:nth-child(8), #cameraTable td:nth-child(8) { width: 10%; }
   th { font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.03em; color: var(--muted); font-weight: 600; }
   tbody tr:hover { background: color-mix(in srgb, var(--accent) 5%, transparent); }
   .mono { font-family: var(--mono); font-size: 0.82em; }
@@ -452,15 +492,14 @@ const indexHTML = `<!doctype html>
   .pill.warn { color: var(--warn); background: color-mix(in srgb, var(--warn) 16%, transparent); }
   .pill.idle { color: var(--muted); background: color-mix(in srgb, var(--muted) 12%, transparent); }
   .muted { color: var(--muted); }
-  .ip-line { display: block; white-space: nowrap; }
-  .ip-line.match { color: var(--up); font-weight: 600; }
+  .ip-line { display: block; margin-bottom: 0.3rem; }
+  .ip-line:last-child { margin-bottom: 0; }
   button { cursor: pointer; font: inherit; background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 0.3rem 0.6rem; }
   button:hover { border-color: var(--accent); }
   button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
   .actions button { margin-right: 0.3rem; padding: 0.22rem 0.5rem; font-size: 0.78rem; }
-  .toolbar { display: flex; align-items: center; justify-content: space-between; gap: 1rem; margin: 0.9rem 0; flex-wrap: wrap; }
-  .toolbar .settings { display: flex; align-items: center; gap: 0.5rem; font-size: 0.8rem; }
-  .toolbar .settings input { font-family: var(--mono); font-size: 0.8rem; padding: 0.28rem 0.5rem; border-radius: 4px; border: 1px solid var(--border); background: var(--panel); color: var(--text); width: 11rem; }
+  .toolbar { display: flex; align-items: center; justify-content: space-between; gap: 1rem; margin-bottom: 1.2rem; flex-wrap: wrap; }
+  .toolbarActions { display: flex; align-items: center; gap: 0.6rem; }
   #banner { display: none; background: color-mix(in srgb, var(--warn) 20%, var(--panel)); border: 1px solid var(--warn); color: var(--text); padding: 0.5rem 0.8rem; border-radius: 6px; margin-bottom: 1rem; font-size: 0.85rem; }
   #banner.show { display: block; }
   #form { display: none; padding: 1rem; margin-bottom: 1.5rem; }
@@ -468,7 +507,9 @@ const indexHTML = `<!doctype html>
   #events { display: none; padding: 1rem; margin-top: 1rem; }
   #events.show { display: block; }
   #events table { font-size: 0.8rem; }
-  #events input[type=text] { width: 100%; padding: 0.35rem; box-sizing: border-box; margin-top: 0.2rem; font-family: var(--mono); font-size: 0.78rem; }
+  #events .eventsScroll { max-height: 22rem; overflow-y: auto; border: 1px solid var(--border); border-radius: 6px; }
+  #events .eventsScroll table { width: 100%; }
+  #events .eventsScroll thead th { position: sticky; top: 0; background: var(--panel); }
   #form label { display: block; margin-bottom: 0.6rem; font-size: 0.8rem; color: var(--muted); }
   #form input[type=text], #form input[type=password], #form input[type=number] { width: 100%; padding: 0.35rem; box-sizing: border-box; margin-top: 0.25rem; border: 1px solid var(--border); border-radius: 4px; background: var(--bg); color: var(--text); font: inherit; }
   #form .row { display: flex; gap: 1rem; }
@@ -479,32 +520,39 @@ const indexHTML = `<!doctype html>
   #serverStats .stat { display: flex; flex-direction: column; gap: 0.15rem; }
   #serverStats .statLabel { color: var(--muted); font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.03em; }
   #serverStats span:not(.statLabel) { font-family: var(--mono); }
+  #logs { display: none; padding: 1rem; margin-top: 1rem; }
+  #logs.show { display: block; }
+  #logs .logToolbar { display: flex; align-items: center; gap: 0.8rem; margin-bottom: 0.6rem; font-size: 0.8rem; }
+  #logLines { max-height: 26rem; overflow-y: auto; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 0.6rem 0.8rem; font-family: var(--mono); font-size: 0.76rem; white-space: pre-wrap; word-break: break-all; }
+  #logLines .log-warn { color: var(--warn); }
+  #logLines .log-error { color: var(--down); }
+  #logLines .log-debug { color: var(--muted); }
 </style>
 </head>
 <body>
-<h1>ReolinkProxy</h1>
-<div class="sub">Baichuan &rarr; RTSP/ONVIF bridge status and camera config.</div>
+<div class="toolbar">
+  <div>
+    <h1>ReolinkProxy</h1>
+    <div class="sub">Baichuan &rarr; RTSP/ONVIF bridge status and camera config.</div>
+  </div>
+  <div class="toolbarActions">
+    <button id="logsBtn">Logs</button>
+    <button id="addBtn" class="primary">+ Add camera</button>
+  </div>
+</div>
 
 <div id="banner">Configuration changed. <button id="restartBtn">Restart now</button> to apply it.</div>
 
-<div class="toolbar">
-  <div class="settings">
-    <label for="f_protect_ip">NVR / Protect IP</label>
-    <input type="text" id="f_protect_ip" placeholder="e.g. 10.0.0.1">
-    <button id="saveSettingsBtn">Save</button>
-    <span id="settingsSaved" class="muted"></span>
-  </div>
-  <button id="addBtn" class="primary">+ Add camera</button>
-</div>
-
 <div class="panel" id="serverStats">
+  <div class="stat"><span class="statLabel">Cameras</span><span id="stat_cameras">-</span></div>
+  <div class="stat"><span class="statLabel">RTSP clients</span><span id="stat_clients">-</span></div>
+  <div class="stat"><span class="statLabel">Bandwidth</span><span id="stat_bandwidth">-</span></div>
   <div class="stat"><span class="statLabel">Uptime</span><span id="stat_uptime">-</span></div>
   <div class="stat"><span class="statLabel">Memory</span><span id="stat_mem">-</span></div>
   <div class="stat"><span class="statLabel">Goroutines</span><span id="stat_goroutines">-</span></div>
   <div class="stat"><span class="statLabel">GC runs</span><span id="stat_gc">-</span></div>
   <div class="stat"><span class="statLabel">CPUs</span><span id="stat_cpu">-</span></div>
   <div class="stat"><span class="statLabel">Go</span><span id="stat_goversion">-</span></div>
-  <div class="stat"><span class="statLabel">Cameras</span><span id="stat_cameras">-</span></div>
 </div>
 
 <div class="panel">
@@ -529,8 +577,7 @@ const indexHTML = `<!doctype html>
   </div>
   <label>ONVIF port (blank = auto)<input type="number" id="f_onvif_port"></label>
   <div class="checks">
-    <label><input type="checkbox" id="f_battery_camera"> Battery-powered camera</label>
-    <label id="f_pause_on_motion_row"><input type="checkbox" id="f_pause_on_motion"> Pause stream when idle without motion</label>
+    <label><input type="checkbox" id="f_pause_on_motion"> Pause stream when idle without motion</label>
     <label><input type="checkbox" id="f_sub_uses_extern"> Use Extern stream as Sub (higher quality low tier, if the camera supports it)</label>
   </div>
   <div>
@@ -543,33 +590,45 @@ const indexHTML = `<!doctype html>
 <div id="events" class="panel">
   <h3 id="eventsTitle">Events</h3>
   <p class="muted">Motion events come from the Baichuan connection. camera-onvif events are forwarded verbatim from the camera's own ONVIF events service (includes smart/AI topics on camera models/firmware that expose them there). test events are synthetic, for verifying the pipeline through to your NVR.</p>
+  <div class="eventsScroll">
   <table>
-    <thead><tr><th>Time</th><th>Source</th><th>Topic</th><th>Item</th><th>Value</th></tr></thead>
+    <thead><tr><th>Time</th><th>Source</th><th>Event</th><th>Item</th><th>Value</th></tr></thead>
     <tbody id="eventRows"></tbody>
   </table>
+  </div>
   <h4>Send a test event</h4>
-  <p class="muted">These presets use the real ONVIF topic names this camera itself emits for smart detections (confirmed by capturing its live event feed) - useful for checking whether your NVR reacts to each detection class without waiting for the real thing to walk by.</p>
+  <p class="muted">These presets use the real ONVIF topic names this camera itself emits for smart detections (confirmed by capturing its live event feed) - useful for checking whether your NVR reacts to each detection class without waiting for the real thing to walk by. Each one automatically sends the matching "stop" event a few seconds later, like a real detection clearing.</p>
   <div class="actions">
-    <button data-preset="motion-on">Motion (start)</button>
-    <button data-preset="motion-off">Motion (stop)</button>
+    <button data-preset="motion">Motion</button>
     <button data-preset="person">Person</button>
     <button data-preset="car">Car / vehicle</button>
     <button data-preset="animal">Animal</button>
   </div>
-  <h4>Custom</h4>
-  <div class="row">
-    <label>Topic<input type="text" id="te_topic" value="tns1:RuleEngine/CellMotionDetector/Motion"></label>
-    <label>Item name<input type="text" id="te_item"  value="IsMotion"></label>
-    <label>Item value<input type="text" id="te_value" value="true"></label>
-  </div>
-  <button id="sendTestEventBtn">Send custom test event</button>
   <button id="closeEventsBtn" type="button">Close</button>
+</div>
+
+<div id="logs" class="panel">
+  <h3>Logs</h3>
+  <div class="logToolbar">
+    <label>Level
+      <select id="logLevelSelect">
+        <option value="debug">debug</option>
+        <option value="info">info</option>
+        <option value="warn">warn</option>
+        <option value="error">error</option>
+      </select>
+    </label>
+    <label><input type="checkbox" id="logAutoRefresh" checked> Auto-refresh</label>
+    <button id="refreshLogsBtn" type="button">Refresh now</button>
+    <span class="muted">Showing the last 500 lines, kept in memory (not written to disk).</span>
+  </div>
+  <div id="logLines"></div>
+  <div style="margin-top:0.6rem"><button id="closeLogsBtn" type="button">Close</button></div>
 </div>
 
 <script>
 var editing = null; // camera name being edited, or null when adding
 var editingCamera = null; // full camera object being edited, for fields not shown in the form (stream/channel)
-var protectIP = '';
 
 function apiGetStatus() { return fetch('/api/status').then(function(r) { return r.json(); }); }
 function apiGetCameras() { return fetch('/api/cameras').then(function(r) { return r.json(); }); }
@@ -596,12 +655,13 @@ function renderServerStats(stats) {
   document.getElementById('stat_cpu').textContent = stats.num_cpu;
   document.getElementById('stat_goversion').textContent = stats.go_version;
   document.getElementById('stat_cameras').textContent = stats.num_cameras;
+  document.getElementById('stat_clients').textContent = stats.total_clients;
+  document.getElementById('stat_bandwidth').textContent = fmtBitrate(stats.total_bitrate_kbps) || '0 kbps';
 }
 
 function refreshServerStats() {
   apiGetServerStats().then(renderServerStats);
 }
-function apiGetSettings() { return fetch('/api/settings').then(function(r) { return r.json(); }); }
 
 function showBanner() { document.getElementById('banner').classList.add('show'); }
 
@@ -611,9 +671,15 @@ function dotClass(view) {
   return 'up';
 }
 
+function fmtBitrate(kbps) {
+  if (!kbps || kbps <= 0) return '';
+  return kbps >= 1000 ? (kbps / 1000).toFixed(2) + ' Mbps' : Math.round(kbps) + ' kbps';
+}
+
 function fmtStream(s) {
   var res = (s.width && s.height) ? (s.width + 'x' + s.height) : '?';
-  return '<span class="mono">' + s.path + '</span> <span class="muted">' + res + (s.fps ? ' @' + s.fps + 'fps' : '') + ' ' + (s.codec || '') + '</span>';
+  var bitrate = fmtBitrate(s.bitrate_kbps);
+  return '<span class="mono">' + s.path + '</span> <span class="muted">' + res + (s.fps ? ' @' + s.fps + 'fps' : '') + ' ' + (s.codec || '') + (bitrate ? ' &middot; ' + bitrate : '') + '</span>';
 }
 
 function fmtMotion(m) {
@@ -632,10 +698,9 @@ function fmtAgo(t) {
 }
 
 function ipLine(ip, sinceLabel, since, path) {
-  var cls = (protectIP && ip === protectIP) ? 'ip-line mono match' : 'ip-line mono';
   var pathPart = path ? (' <span class="muted">&rarr; ' + path + '</span>') : '';
   var extra = since ? (' <span class="muted">(' + sinceLabel + ' ' + fmtAgo(since) + ')</span>') : '';
-  return '<span class="' + cls + '">' + ip + pathPart + extra + '</span>';
+  return '<span class="ip-line mono">' + ip + pathPart + extra + '</span>';
 }
 
 function fmtClients(view) {
@@ -645,18 +710,20 @@ function fmtClients(view) {
 
 function fmtSubscribers(view) {
   var lines = (view.event_subscriber_list || []).map(function(s) { return ipLine(s.ip, 'last seen', s.last_seen); });
-  return lines.join('') || '<span class="muted">none</span>';
+  var forwarder = '<div class="ip-line muted">' +
+    (view.event_forwarder_up ? '<span class="dot up"></span>camera events ok' : '<span class="dot down"></span>camera events down') +
+    ' &middot; ' + view.events_24h + ' in 24h</div>';
+  return forwarder + (lines.join('') || '<span class="muted">no subscribers</span>');
 }
 
 function statusCell(view) {
-  var pill = view.connected ? '<span class="pill up">connected</span>' : '<span class="pill down">disconnected</span>';
-  var protectLine = '';
-  if (protectIP) {
-    protectLine = view.protect_connected
-      ? '<div class="ip-line match" style="margin-top:0.2rem">&#9679; Protect connected</div>'
-      : '<div class="ip-line muted" style="margin-top:0.2rem">&#9675; Protect not seen</div>';
+  var title = view.connected ? 'connected' : 'disconnected';
+  var reconnects = '';
+  if (view.reconnects > 0) {
+    var errTitle = view.last_error ? view.last_error.replace(/"/g, '&quot;') : '';
+    reconnects = ' <span class="pill warn" title="' + errTitle + '">&#8635; ' + view.reconnects + '</span>';
   }
-  return '<span class="dot ' + dotClass(view) + '"></span>' + pill + protectLine;
+  return '<span class="dot ' + dotClass(view) + '" title="' + title + '"></span>' + reconnects;
 }
 
 function render(statusList, cameraList) {
@@ -701,26 +768,6 @@ function refresh() {
   });
 }
 
-function loadSettings() {
-  apiGetSettings().then(function(s) {
-    protectIP = s.protect_server_ip || '';
-    document.getElementById('f_protect_ip').value = protectIP;
-  });
-}
-
-function saveSettings() {
-  var ip = document.getElementById('f_protect_ip').value.trim();
-  fetch('/api/settings', { method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ protect_server_ip: ip }) })
-    .then(function(r) { return r.json(); })
-    .then(function(s) {
-      protectIP = s.protect_server_ip || '';
-      var saved = document.getElementById('settingsSaved');
-      saved.textContent = 'saved';
-      setTimeout(function() { saved.textContent = ''; }, 1500);
-      refresh();
-    });
-}
-
 function openForm(camera) {
   document.getElementById('formError').textContent = '';
   editing = camera ? camera.name : null;
@@ -733,17 +780,9 @@ function openForm(camera) {
   document.getElementById('f_username').value = camera ? camera.username : '';
   document.getElementById('f_password').value = camera ? camera.password : '';
   document.getElementById('f_onvif_port').value = camera && camera.onvif_port ? camera.onvif_port : '';
-  document.getElementById('f_battery_camera').checked = !!(camera && camera.battery_camera);
   document.getElementById('f_pause_on_motion').checked = !!(camera && camera.pause_on_motion);
   document.getElementById('f_sub_uses_extern').checked = !!(camera && camera.sub_uses_extern);
-  updatePauseVisibility();
   document.getElementById('form').classList.add('show');
-}
-
-function updatePauseVisibility() {
-  var batteryCamera = document.getElementById('f_battery_camera').checked;
-  document.getElementById('f_pause_on_motion_row').style.display = batteryCamera ? '' : 'none';
-  if (!batteryCamera) { document.getElementById('f_pause_on_motion').checked = false; }
 }
 
 function closeForm() {
@@ -759,7 +798,6 @@ function saveCamera() {
     port: parseInt(document.getElementById('f_port').value, 10) || 9000,
     username: document.getElementById('f_username').value,
     password: document.getElementById('f_password').value,
-    battery_camera: document.getElementById('f_battery_camera').checked,
     pause_on_motion: document.getElementById('f_pause_on_motion').checked,
     sub_uses_extern: document.getElementById('f_sub_uses_extern').checked
   };
@@ -808,11 +846,36 @@ function fmtTime(t) {
   return isNaN(d.getTime()) ? t : d.toLocaleTimeString();
 }
 
+// topicLabels maps a distinctive substring of an ONVIF topic to a human-readable name.
+// Matched by substring (not exact equality) so it survives topics some camera firmwares
+// prefix/namespace slightly differently.
+var topicLabels = [
+  ['CellMotionDetector', 'Motion'],
+  ['PeopleDetect', 'Person'],
+  ['VehicleDetect', 'Vehicle'],
+  ['DogCatDetect', 'Animal'],
+  ['FaceDetect', 'Face'],
+  ['VisitorDetect', 'Doorbell press']
+];
+
+function humanizeTopic(topic) {
+  for (var i = 0; i < topicLabels.length; i++) {
+    if (topic.indexOf(topicLabels[i][0]) !== -1) return topicLabels[i][1];
+  }
+  // Unrecognized topic: fall back to the last path segment, space-separated.
+  var parts = topic.split('/');
+  var last = parts[parts.length - 1] || topic;
+  return last.replace(/([a-z0-9])([A-Z])/g, '$1 $2');
+}
+
 function refreshEvents() {
   if (!eventsCamera) return;
   fetch('/api/cameras/' + encodeURIComponent(eventsCamera) + '/events').then(function(r) { return r.json(); }).then(function(events) {
-    var rows = events.slice().reverse().map(function(ev) {
-      return '<tr><td>' + fmtTime(ev.time) + '</td><td>' + ev.source + '</td><td><code>' + ev.topic + '</code></td><td>' + ev.item_name + '</td><td>' + ev.item_value + '</td></tr>';
+    // "false" (cleared/idle) states are mostly noise here - keep the log focused on actual
+    // detections/transitions rather than every auto-generated "it's over now" event.
+    var shown = events.filter(function(ev) { return String(ev.item_value).toLowerCase() !== 'false'; });
+    var rows = shown.slice().reverse().map(function(ev) {
+      return '<tr><td>' + fmtTime(ev.time) + '</td><td>' + ev.source + '</td><td title="' + ev.topic + '">' + humanizeTopic(ev.topic) + '</td><td>' + ev.item_name + '</td><td>' + ev.item_value + '</td></tr>';
     });
     document.getElementById('eventRows').innerHTML = rows.join('') || '<tr><td colspan="5" class="muted">No events yet.</td></tr>';
   });
@@ -833,12 +896,57 @@ function closeEvents() {
   if (eventsPoll) { clearInterval(eventsPoll); eventsPoll = null; }
 }
 
+var logsPoll = null;
+
+function escapeHtml(s) {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function colorizeLogLine(line) {
+  var m = line.match(/\t(debug|info|warn|error)\t/);
+  var cls = m ? 'log-' + m[1] : '';
+  return '<div class="' + cls + '">' + escapeHtml(line) + '</div>';
+}
+
+function refreshLogs() {
+  var limit = 500;
+  fetch('/api/logs?limit=' + limit).then(function(r) { return r.json(); }).then(function(data) {
+    var box = document.getElementById('logLines');
+    var nearBottom = (box.scrollHeight - box.scrollTop - box.clientHeight) < 40;
+    box.innerHTML = (data.lines || []).map(colorizeLogLine).join('');
+    if (nearBottom) { box.scrollTop = box.scrollHeight; }
+    var select = document.getElementById('logLevelSelect');
+    if (document.activeElement !== select) { select.value = data.level; }
+  });
+}
+
+function openLogs() {
+  document.getElementById('logs').classList.add('show');
+  refreshLogs();
+  document.getElementById('logLines').scrollTop = document.getElementById('logLines').scrollHeight;
+  if (logsPoll) clearInterval(logsPoll);
+  logsPoll = setInterval(function() {
+    if (document.getElementById('logAutoRefresh').checked) { refreshLogs(); }
+  }, 2000);
+}
+
+function closeLogs() {
+  document.getElementById('logs').classList.remove('show');
+  if (logsPoll) { clearInterval(logsPoll); logsPoll = null; }
+}
+
+function changeLogLevel() {
+  var level = document.getElementById('logLevelSelect').value;
+  fetch('/api/logs/level', { method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ level: level }) });
+}
+
+// autoOffMs, when set, sends the same topic/item_name with item_value 'false' that many ms
+// after the 'true' event - simulating a detection clearing, like the real camera would.
 var testEventPresets = {
-  'motion-on':  { topic: 'tns1:RuleEngine/CellMotionDetector/Motion',   item_name: 'IsMotion', item_value: 'true' },
-  'motion-off': { topic: 'tns1:RuleEngine/CellMotionDetector/Motion',   item_name: 'IsMotion', item_value: 'false' },
-  'person':     { topic: 'tns1:RuleEngine/MyRuleDetector/PeopleDetect', item_name: 'State',    item_value: 'true' },
-  'car':        { topic: 'tns1:RuleEngine/MyRuleDetector/VehicleDetect', item_name: 'State',   item_value: 'true' },
-  'animal':     { topic: 'tns1:RuleEngine/MyRuleDetector/DogCatDetect', item_name: 'State',    item_value: 'true' }
+  'motion':     { topic: 'tns1:RuleEngine/CellMotionDetector/Motion',   item_name: 'IsMotion', item_value: 'true', autoOffMs: 5000 },
+  'person':     { topic: 'tns1:RuleEngine/MyRuleDetector/PeopleDetect', item_name: 'State',    item_value: 'true', autoOffMs: 5000 },
+  'car':        { topic: 'tns1:RuleEngine/MyRuleDetector/VehicleDetect', item_name: 'State',   item_value: 'true', autoOffMs: 5000 },
+  'animal':     { topic: 'tns1:RuleEngine/MyRuleDetector/DogCatDetect', item_name: 'State',    item_value: 'true', autoOffMs: 5000 }
 };
 
 function sendTestEventBody(body) {
@@ -850,15 +958,13 @@ function sendTestEventBody(body) {
 
 function sendTestEventPreset(name) {
   var preset = testEventPresets[name];
-  if (preset) sendTestEventBody(preset);
-}
-
-function sendTestEvent() {
-  sendTestEventBody({
-    topic: document.getElementById('te_topic').value.trim(),
-    item_name: document.getElementById('te_item').value.trim(),
-    item_value: document.getElementById('te_value').value.trim()
-  });
+  if (!preset) return;
+  sendTestEventBody({ topic: preset.topic, item_name: preset.item_name, item_value: preset.item_value });
+  if (preset.autoOffMs) {
+    setTimeout(function() {
+      sendTestEventBody({ topic: preset.topic, item_name: preset.item_name, item_value: 'false' });
+    }, preset.autoOffMs);
+  }
 }
 
 function waitForRestart() {
@@ -882,17 +988,17 @@ function restartNow() {
 
 document.getElementById('addBtn').addEventListener('click', function() { openForm(null); });
 document.getElementById('cancelBtn').addEventListener('click', closeForm);
-document.getElementById('f_battery_camera').addEventListener('change', updatePauseVisibility);
 document.getElementById('saveBtn').addEventListener('click', saveCamera);
 document.getElementById('restartBtn').addEventListener('click', restartNow);
 document.getElementById('closeEventsBtn').addEventListener('click', closeEvents);
-document.getElementById('sendTestEventBtn').addEventListener('click', sendTestEvent);
-document.getElementById('saveSettingsBtn').addEventListener('click', saveSettings);
 document.querySelectorAll('[data-preset]').forEach(function(btn) {
   btn.addEventListener('click', function() { sendTestEventPreset(btn.getAttribute('data-preset')); });
 });
+document.getElementById('logsBtn').addEventListener('click', openLogs);
+document.getElementById('closeLogsBtn').addEventListener('click', closeLogs);
+document.getElementById('refreshLogsBtn').addEventListener('click', refreshLogs);
+document.getElementById('logLevelSelect').addEventListener('change', changeLogLevel);
 
-loadSettings();
 refresh();
 refreshServerStats();
 setInterval(refresh, 3000);

@@ -14,8 +14,25 @@ type CameraDevice struct {
 	cameraName string
 	cfg        baichuan.Config
 
-	mu     sync.Mutex
-	client *baichuan.Client
+	mu          sync.Mutex
+	client      *baichuan.Client
+	connectedAt time.Time
+	reconnects  int
+	lastError   string
+}
+
+// DeviceStats is a snapshot of this camera's Baichuan connection health, for the status
+// API/UI - primarily to spot an unstable camera (frequent reconnects) at a glance.
+type DeviceStats struct {
+	ConnectedAt time.Time
+	Reconnects  int
+	LastError   string
+}
+
+func (m *CameraDevice) Stats() DeviceStats {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return DeviceStats{ConnectedAt: m.connectedAt, Reconnects: m.reconnects, LastError: m.lastError}
 }
 
 func NewCameraDevice(cameraName string, cfg baichuan.Config) *CameraDevice {
@@ -36,16 +53,27 @@ func (m *CameraDevice) Ensure(ctx context.Context) (*baichuan.Client, error) {
 		m.closeLocked("")
 	}
 
+	wasConnectedBefore := !m.connectedAt.IsZero()
+
 	client, err := baichuan.Dial(ctx, m.cfg)
 	if err != nil {
+		m.lastError = err.Error()
+		log.Warnf("camera %s: dial failed: %v", m.cameraName, err)
 		return nil, err
 	}
 	if err := client.Login(ctx); err != nil {
 		_ = client.Close()
+		m.lastError = err.Error()
+		log.Warnf("camera %s: login failed: %v", m.cameraName, err)
 		return nil, err
 	}
 
+	log.Infof("camera %s: connected", m.cameraName)
 	m.client = client
+	m.connectedAt = time.Now()
+	if wasConnectedBefore {
+		m.reconnects++
+	}
 	return client, nil
 }
 
@@ -98,6 +126,7 @@ func (m *CameraDevice) closeLocked(reason string) {
 	}
 	if reason != "" {
 		log.Printf("camera %s reconnecting: %s", m.cameraName, reason)
+		m.lastError = reason
 	}
 	_ = m.client.Close()
 	m.client = nil

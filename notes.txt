@@ -1,213 +1,106 @@
-# Baichuan-to-ONVIF/RTSP Bridge for UniFi Protect — Project Spec
+# Baichuan-to-ONVIF/RTSP Bridge for UniFi Protect — Project Notes
 
-## Problem
-Reolink cameras' built-in RTSP stream is unstable for UniFi Protect ingestion. The
-Baichuan protocol (TCP/9000, proprietary, reverse-engineered) used by the Reolink app/NVR
-is stable. UniFi Protect can adopt third-party cameras via ONVIF but requires:
+## Why this exists
+Reolink cameras' own RTSP/ONVIF stream is unreliable for continuous NVR ingestion -
+stalls, dropped frames, desync - especially on the sub/low profile. The Baichuan protocol
+(TCP/9000, proprietary, reverse-engineered, used internally by the official Reolink
+app/NVR) is much more stable. Goal: bridge Baichuan -> standard RTSP + ONVIF so **UniFi
+Protect** can adopt these cameras as clean third-party devices, with real motion/smart
+detection events, not a degraded "generic RTSP camera."
 
+UniFi Protect specifically requires:
 - A stable, compliant RTSP stream.
-- Each camera to appear as a distinct ONVIF device on its own port. Confirmed: this does
-  NOT require macvlan / real L2 MAC spoofing. All virtual ONVIF devices can share the
-  host's/container's single real IP — only the port needs to differ per camera, and the
-  "MAC address" UniFi cares about is just a value reported inside the ONVIF
-  GetDeviceInformation/GetNetworkInterfaces/discovery response, not an actual
-  network-layer MAC.
-- ONVIF motion events. Confirmed via research: Protect does NOT run its own AI/motion
-  analysis on third-party ONVIF cameras — it is entirely dependent on events pushed/pulled
-  over ONVIF.
-- Smart detection (person/vehicle/animal/package) is possible for third-party cameras too,
-  normally via Ubiquiti's paid "AI Port" hardware — but Protect will ingest the same
-  ONVIF smart-event topics from any ONVIF source and write them into its own timeline/
-  smart-detection UI. So a self-hosted object detector that emits proper ONVIF analytics
-  events is a software-only substitute for the AI Port. This is the "extra software"
-  component of this project.
+- Each camera to appear as a distinct ONVIF device on its own port. This does NOT require
+  macvlan / real L2 MAC spoofing - all virtual ONVIF devices share the host's/container's
+  one real IP, only the port differs per camera, and the "MAC address" Protect cares about
+  is just a value reported inside ONVIF GetDeviceInformation/GetNetworkInterfaces, not an
+  actual network-layer MAC.
+- ONVIF motion/smart-detection events. Protect does NOT run its own AI/motion analysis on
+  third-party ONVIF cameras - it is entirely dependent on events pushed/pulled over ONVIF.
 
-## Chosen approach: fork and extend `Shareed2k/reolinkproxy`
-Decision (2026-07-15, revised): rather than reimplementing the Baichuan protocol from
-scratch, this project is now a fork of github.com/Shareed2k/reolinkproxy (Go, MIT
-license), cloned into this directory with full git history. The `upstream` remote points
-at the original repo. Reasoning: it already has a mature, tested Baichuan TCP client
-(login/crypto/video/audio/motion), an RTSP server built on `gortsplib`, MQTT motion
-publishing, and a working (if not yet per-camera) ONVIF Device/Media service + WS-Discovery
-responder. Reimplementing all of that from zero was not a good use of effort once this was
-found.
+## Origin: fork of `Shareed2k/reolinkproxy`
+Started (2026-07-15) as a fork rather than a from-scratch reimplementation, to reuse its
+mature Baichuan TCP client (login/crypto/video/audio/motion) and gortsplib-based RTSP
+server. The project has since diverged substantially from upstream - see "How the plan
+changed" below.
 
-### What reolinkproxy already gives us
-- `pkg/baichuan`: TCP client, crypto/obfuscation, login, video/audio streaming, motion
-  listener (`CameraDevice.WatchMotion`), talkback.
-- RTSP server via `gortsplib`, multiple stream profiles (main/sub/extern) per camera,
-  two-way audio.
-- A single shared ONVIF Device+Media(+Media2) SOAP service for **all** cameras combined
-  (`cmd/reolinkproxy/onvif.go`), presenting itself as one multi-channel "NVR" device with
-  one profile per camera stream, on one shared port (default `:8002`).
-- A single shared WS-Discovery responder (`cmd/reolinkproxy/wsdiscovery.go`) — replies with
-  one `ProbeMatch` for the whole proxy, one hardcoded `HwAddress = 00:00:00:00:00:00` in
-  `GetNetworkInterfaces`.
-- Env-var driven config only (`REOLINK_CAMERA_<n>_*`); `config.example.yml`/`Config.Cameras`
-  YAML field exist in the struct but nothing in `main.go` currently loads cameras from a
-  YAML file — env vars always win. No web UI.
+## How the plan changed since the original spec
+The original spec (see git history) planned to hand-generate ONVIF Media2 profile/encoder
+XML per camera, and to eventually add local object-detection inference (ONNX/YOLO) as a
+"smart events" substitute. Neither happened as planned:
 
-### What we are adding on top
-1. **Per-camera ONVIF virtual server** — the core gap vs. what Protect needs. Split the
-   single shared `onvifServer`/`:8002` into one instance per camera, each on its own
-   configurable port, each with its own `SerialNumber`, its own fake/stable
-   `HwAddress`-style identifier (config-driven, not real MAC spoofing — see above), and
-   `metas` filtered to just that camera's own streams. WS-Discovery must reply once per
-   configured camera (still one shared UDP 3702 socket — can't bind that per camera — but
-   iterating the per-camera configs to send N `ProbeMatch` replies per probe).
-2. **ONVIF Events / PullPoint service** — currently missing entirely. Add a `tev:` Events
-   SOAP endpoint per camera implementing `GetEventProperties`, `CreatePullPointSubscription`,
-   `PullMessages`, `Renew`, `Unsubscribe`, sourced from the existing
-   `CameraDevice.WatchMotion` callback (already implemented, currently only wired to MQTT).
-   Basic motion topic (`tns1:VideoSource/MotionAlarm` or `tns1:RuleEngine/
-   CellMotionDetector/Motion`, `IsMotion` boolean) is the minimum viable version — this
-   alone is what Protect needs for a normal camera-level motion alarm.
-3. **Smart/object-detection events ("extra software")** — a new component that decodes
-   occasional frames from the already-available H.264/H.265 NALU stream, runs local object
-   detection (person/vehicle/animal at minimum), and emits ONVIF analytics event topics
-   for those detections through the same Events service as (2), so Protect can log them as
-   smart detections without Ubiquiti's AI Port. Go doesn't have a strong native inference
-   ecosystem, so this will likely mean ONNX Runtime via cgo bindings with a small YOLO
-   model, run at a low frame rate (not every frame) to keep CPU cost sane. This is the
-   most speculative/expensive new piece — build it after (1) and (2) are solid and tested
-   against a real camera + real Protect instance.
-4. **Web UI** — status per camera (connected? streaming? last motion/detection? last
-   error?) plus add/edit/remove camera forms. Needs a real config-file loader added (YAML
-   file → `Config`, replacing/supplementing the env-var-only path), since the web UI has to
-   persist edits somewhere durable that survives restarts — currently nothing reads
-   `config.example.yml`-style files at all.
-5. **(Later) Docker** — reolinkproxy already ships a Dockerfile/compose aimed at
-   `network_mode: host` (needed for WS-Discovery multicast + UID discovery). Once (1)-(4)
-   are done, extend that image rather than starting a new one. Not now, per original scope.
+1. **Hand-rolled ONVIF XML -> transparent reverse proxy.** Getting every camera
+   model/firmware's Media2 response (profiles, encoder configs, capabilities) byte-for-byte
+   right by hand-generating XML was a losing battle against real-world firmware quirks.
+   Replaced with a transparent reverse proxy: `GetProfiles`/`GetStreamUri`/etc. requests are
+   forwarded verbatim to the camera's *own* ONVIF Media2 service, re-signed with real
+   credentials, and only the RTSP URI in the response is rewritten to point at this proxy.
+   Every other field an NVR might depend on matches the physical camera exactly, because it
+   comes from the physical camera. ONVIF Device/Events services remain proxy-native (they
+   need per-camera identity/port that the real camera doesn't have).
+2. **No local object-detection needed - cameras already emit it.** Live testing showed a
+   real camera's ONVIF PullPoint feed emits proper smart-detection topics
+   (`tns1:RuleEngine/MyRuleDetector/{PeopleDetect,VehicleDetect,DogCatDetect,Package,...}`)
+   that its static `GetEventProperties` response never advertised. So `onvifclient.go`
+   subscribes to the camera's own events service and forwards every notification into this
+   proxy's per-camera event broker verbatim - Protect gets real smart events without any
+   local inference. The originally-planned ONNX/YOLO phase is shelved indefinitely; revisit
+   only if a camera model turns out not to expose this itself.
+3. **Baichuan client bug + RTSP pacer rewrite (stability, not scope).** Live testing on a
+   real Protect instance surfaced stutter/freezes on the sub/low stream that did not
+   reproduce in VLC/ffprobe (which mask jitter with their own buffering; Protect doesn't).
+   Root-caused to four distinct bugs: (a) Main's high message volume could starve Sub's
+   shared Baichuan subscriber channel (fixed via per-StreamType dispatch), and (b) three
+   separate scheduling bugs in the RTSP media pacer's wall-clock model (an off-by-one in
+   which item's duration drove the next emission time, a self-inflicted stall from
+   restoring latency cushion on the wrong branch, and a latency-inflation feedback loop).
+   All four fixed and confirmed via live diagnostics (zero deviation events over a 75s
+   window, down from firing on nearly every frame).
+4. **Web UI + persisted config added, not originally scoped.** Env-var-only config didn't
+   scale to add/edit/remove-camera workflows or runtime visibility, so a YAML config store
+   (`configstore.go`) plus a status/config web UI (`webui.go`) were added: camera CRUD,
+   live per-camera status (connected/reconnects/last error, RTSP client count, bitrate,
+   event-forwarder health, 24h event count), a scrollable events log with human-readable
+   topic names, adjustable log level with a live log viewer, and server stats (uptime,
+   memory, goroutines, GC runs). `REOLINK_*` env vars now only *bootstrap* the config file
+   on a first run; the file (editable by hand or via the web UI) is authoritative after
+   that for cameras **and** for `mqtt`/`server`/`onvif` global settings.
+5. **NVR-specific "Protect connected" status removed.** An earlier iteration added a
+   dedicated "is UniFi Protect reachable" indicator (`SERVER_PROTECT_IP`). Removed by
+   request - the web UI shows generic per-camera/event-forwarder health instead, without
+   assuming which specific NVR is consuming the stream.
 
-## Issues / risks flagged
-- **Protect's ONVIF flow expects one device = one camera.** The upstream project's
-  "single NVR with N profiles" model is very likely *not* adoptable as N separate cameras
-  in Protect — this is the whole reason per-camera ONVIF instances (item 1) are the first
-  priority, not a nice-to-have.
-- **Identity stability** — once split into per-camera servers, keep each camera's port,
-  device UUID, serial, and fake MAC stable across restarts/config edits, or Protect will
-  treat it as a new camera on every change.
-- **WS-Discovery reachability in Docker** — multicast UDP discovery may not cross the
-  default Docker bridge network; upstream already defaults its compose/Docker docs to
-  `network_mode: host` for this reason — keep doing that later.
-- **Baichuan session limits** — reolinkproxy already holds a persistent Baichuan session
-  per camera; this may still contend with the official Reolink app/NVR accessing the same
-  camera concurrently. Same caveat as before.
-- **H.265 caveat** — some UniFi Protect versions have had issues with H.265 third-party
-  ONVIF streams; default to H.264 sub/main profiles for compatibility if problems appear.
-- **Smart detection scope is a real lift** — decoding video + running inference in a Go
-  service is the least mature part of this plan; treat it as best-effort/phase 2, not a
-  blocker for getting basic motion-triggered Protect adoption working first.
+## Current architecture (high level)
+- `pkg/baichuan`: Baichuan TCP client - login/crypto, video/audio streaming (per-StreamType
+  subscriber dispatch), motion listener, talkback.
+- `cmd/reolinkproxy/pacer.go`: wall-clock media pacer that smooths bursty Baichuan delivery
+  into steady RTP timing before it reaches gortsplib.
+- `cmd/reolinkproxy/onvif.go`: per-camera virtual ONVIF Device/Events service, plus a
+  transparent Media2 reverse proxy to the camera's own ONVIF service (rewrites only the
+  RTSP URI).
+- `cmd/reolinkproxy/onvifclient.go`: subscribes to the camera's *own* ONVIF events service
+  and forwards its real notifications (motion + smart detections) into the proxy's event
+  broker.
+- `cmd/reolinkproxy/wsdiscovery.go`: one shared UDP 3702 WS-Discovery responder, replying
+  once per configured camera with a stable device UUID.
+- `cmd/reolinkproxy/configstore.go` + `webui.go`: persisted YAML config (`config.yml`) and
+  the status/config web UI - camera CRUD, live status, events log, server stats, log
+  viewer.
+- Docker: `network_mode: host` is the recommended deployment (WS-Discovery multicast,
+  Reolink UID broadcast discovery, and per-camera auto-assigned ONVIF ports all need open
+  host-level networking); see README.md for the bridge-mode port list if host networking
+  isn't an option.
 
-## Phasing (status as of 2026-07-15)
-1. DONE — fork builds locally (`go build ./...`, `go vet ./...`, `go test ./...` all clean).
-2. DONE — per-camera ONVIF server + per-camera fake MAC/serial + per-camera WS-Discovery
-   replies. Also fixed a real upstream bug where WS-Discovery sent a fresh random device
-   UUID on every probe response instead of a stable one. Verified live against the running
-   binary (real SOAP GetDeviceInformation request against a per-camera port) — NOT yet
-   verified against a real UniFi Protect instance/real camera hardware.
-3. DONE — ONVIF Events/PullPoint service (`events.go`) wired to the existing
-   `CameraDevice.WatchMotion`. Emits `tns1:RuleEngine/CellMotionDetector/Motion` and
-   `tns1:VideoSource/MotionAlarm`. Verified live: CreatePullPointSubscription → PullMessages
-   round-trip works end-to-end against the running binary.
-4. DONE — YAML config file (`configstore.go`, default `config.yml`) + web UI (`webui.go`,
-   default `:8080`). Env vars (`REOLINK_CAMERA_*`) only bootstrap the file on a first run
-   where it's still empty; the file is authoritative afterward. Add/edit/delete camera
-   verified live through the actual HTTP API, including the duplicate-name-rejection and
-   identity-preservation-on-edit paths, with round-trips confirmed by re-reading the file
-   from disk. Editing config currently requires a manual process restart to take effect —
-   live teardown/rebuild of running Baichuan/RTSP/ONVIF sessions was explicitly scoped out
-   as a separate, harder problem.
-5. NOT STARTED — smart/object-detection event layer (person/vehicle/animal via local
-   inference). Needs a decision on inference approach (see below) before starting.
-6. NOT STARTED — Dockerize (extend upstream's existing Dockerfile/compose), revisit
-   WS-Discovery/multicast networking under `network_mode: host`.
+## Status
+Validated end-to-end against real Reolink camera hardware: Baichuan login/video/audio,
+RTSP playback, per-camera ONVIF Device/Media/Media2 (byte-for-byte via the reverse proxy),
+WS-Security auth, ONVIF Events/PullPoint round-trip, real snapshot proxying, config
+persistence through the web UI's HTTP API, and self-restart from the web UI. The pacer/
+Baichuan stability fixes were confirmed against live UniFi Protect playback specifically
+(the original motivating use case), not just generic RTSP clients.
 
-## Real-hardware validation (2026-07-15, camera at 10.0.30.4)
-Validated end-to-end against a real Reolink camera from this machine (LAN access
-available here after all). Still NOT validated against a real UniFi Protect adoption —
-that step is on the user to do from the Protect UI; this proxy is ready for that test.
-
-Confirmed working live:
-- Baichuan login/video/audio pull (3840x2160 H.264 + AAC, stable, no drops observed).
-- RTSP output plays via ffprobe.
-- Per-camera ONVIF Device/Media services (GetDeviceInformation, GetProfiles) return real
-  camera data on the assigned port.
-- WS-Security auth works both with an explicit ONVIF password and, since credentials now
-  default to the camera's own Baichuan username/password, with no separate ONVIF password
-  configured at all.
-- ONVIF Events/PullPoint: CreatePullPointSubscription -> PullMessages round-trip works.
-- Self-restart from the web UI: old PID exits, new PID comes up and reconnects within ~3s.
-- Config file (config.yml) round-trips correctly through add/duplicate-reject/update/
-  delete via the web UI's HTTP API, and a real bug (camera-only edits blanking the
-  mqtt/server/onvif sections) was caught and fixed via this live testing, not by unit
-  tests alone.
-
-### New: forwarding the camera's own ONVIF events (not just Baichuan motion)
-Built a second event source: `onvifclient.go` is a client that connects to the camera's
-*own* built-in ONVIF events service (discovered via GetCapabilities - it's mounted at a
-different path per camera/firmware, e.g. this camera uses `/onvif/event_service`,
-singular, not `/onvif/events_service` like our own server) and forwards every
-notification it receives into our own per-camera `eventsBroker` verbatim.
-
-Corrected an earlier wrong finding: initially concluded this camera's ONVIF interface
-only exposes basic motion (its GetEventProperties topic-set response really does only
-list CellMotionDetector/Motion and VideoSource/MotionAlarm). That was wrong - live
-capture of its actual PullMessages feed shows it also emits real smart-detection topics
-the static topic-set response never advertised: `tns1:RuleEngine/MyRuleDetector/
-{PeopleDetect,VehicleDetect,DogCatDetect,FaceDetect,Visitor,Package}`, each with a
-`State` boolean SimpleItem. Lesson: GetEventProperties responses can't be trusted to
-enumerate everything a camera actually emits - only a live pull confirms it.
-
-Two real bugs found and fixed via live testing against this camera, neither of which
-would have been caught by unit tests against synthetic fixtures alone:
-1. PullMessages against the camera's PullPoint subscription-manager endpoint
-   (`/onvif/PullSubManager?Idx=...`) 400'd with an empty-reason SOAP fault, even though
-   the *same* WS-Security auth worked fine against the main event service. Fix: that
-   specific endpoint requires WS-Addressing `wsa:To`/`wsa:Action` headers that the main
-   service doesn't. Added `callWithAction` for this.
-2. The retry loop had no backoff on a pull failure, hammering the camera many times per
-   second when pulls failed - caught by watching the live log, not by any test. Fixed
-   with a 10s backoff before resubscribing.
-
-### New: real snapshot/thumbnail proxying
-`GET /api/snapshot/<path>` (used by ONVIF GetSnapshotUri) now proxies a real JPEG from
-the camera instead of 404ing. First attempt went through the generic ONVIF path
-(GetProfiles -> GetSnapshotUri -> fetch with HTTP Digest auth) and worked, but the user
-pointed out Reolink has a much simpler native endpoint:
-`http://<camera-ip>/cgi-bin/api.cgi?cmd=Snap&channel=0&user=<user>&password=<password>`
-(credentials as plain query params, no Digest challenge/response needed). Switched to
-that and deleted the generic ONVIF-discovery + Digest-auth code entirely rather than
-keeping both - this project is Reolink-specific, so there's no case where the more
-complex generic path is actually needed.
-
-### New: web UI events log + test-event buttons
-Added `GET /api/cameras/{name}/events` (last 50 events - motion, forwarded camera-onvif,
-and synthetic test events, each tagged by source) and `POST /api/cameras/{name}/
-test-event` (inject a synthetic event to verify the pipeline through to an NVR without
-waiting on real camera behavior). The web UI's per-camera "Events" panel shows the live
-log plus one-click preset buttons - Motion start/stop, Person, Car, Animal - using the
-real topic names confirmed above, plus a custom topic/item/value form for anything else.
-
-### New: restart-from-web-UI
-`POST /api/restart` triggers the same graceful-shutdown path as SIGTERM (releases every
-port), then self-respawns via `os.Executable()` + `exec.Command` once fully torn down.
-Verified live.
-
-### Still open
-- Smart-detection events ARE flowing from this camera's own ONVIF interface now (see
-  above) - the earlier "phase 5: local object-detection inference" plan is likely
-  unnecessary for cameras that already expose this via their own ONVIF, and should only
-  be revisited if a camera model turns out not to. Not started, and now lower priority.
-- Docker packaging - not started.
-- UniFi Protect adoption itself has not been confirmed by the user yet - this is the
-  next real test: point Protect at 10.0.0.200:8102 (or whichever camera's assigned port)
-  and confirm it adopts the camera, shows live view, and logs motion/smart events.
-
-## Repo layout notes
-- Cloned into this directory with full git history; `git remote -v` shows `upstream` →
-  `https://github.com/Shareed2k/reolinkproxy.git`. No `origin` is set — add the user's own
-  remote when/if they want to push this somewhere.
-- Go 1.26, module `github.com/shareed2k/reolinkproxy` (may want to rename the module path
-  once this diverges enough from upstream to be its own project — not urgent).
+## Still open / not started
+- Docker image published to a registry (currently build-from-source only, see README.md).
+- Broader validation across more Reolink camera models/firmware versions than the ones
+  tested so far - the transparent-reverse-proxy approach should generalize well, but
+  quirky firmware could still surface model-specific edge cases.

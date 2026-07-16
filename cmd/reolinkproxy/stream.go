@@ -664,6 +664,7 @@ type streamMetadata struct {
 	audioSampleRate int
 	audioChannels   int
 	videoCodec      string
+	bitrateKbps     float64
 }
 
 type streamMetadataSnapshot struct {
@@ -677,6 +678,7 @@ type streamMetadataSnapshot struct {
 	AudioSampleRate int
 	AudioChannels   int
 	VideoCodec      string
+	BitrateKbps     float64
 }
 
 func (m *streamMetadata) setVideoInfo(width uint32, height uint32, fps uint8, codec string) {
@@ -688,6 +690,14 @@ func (m *streamMetadata) setVideoInfo(width uint32, height uint32, fps uint8, co
 	if codec != "" {
 		m.videoCodec = codec
 	}
+}
+
+// setBitrate records the measured video bitrate (kbps, over the caller's own sampling
+// window - see the statsTicker in runStream) for display in the status API/UI.
+func (m *streamMetadata) setBitrate(kbps float64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.bitrateKbps = kbps
 }
 
 func (m *streamMetadata) setVideoCodec(codec string) {
@@ -726,6 +736,7 @@ func (m *streamMetadata) snapshot() streamMetadataSnapshot {
 		AudioSampleRate: m.audioSampleRate,
 		AudioChannels:   m.audioChannels,
 		VideoCodec:      m.videoCodec,
+		BitrateKbps:     m.bitrateKbps,
 	}
 }
 

@@ -55,7 +55,7 @@ func main() {
 	cmd := &cli.Command{
 		Name:                      "reolinkproxy",
 		Usage:                     "restream reolink camera feeds as RTSP and ONVIF",
-		UsageText:                 "reolinkproxy [options]\n\nExample camera env:\n  REOLINK_CAMERA_0_NAME=front \n  REOLINK_CAMERA_0_UID=123456 \n  REOLINK_CAMERA_0_HOST=192.168.1.10 \n  REOLINK_CAMERA_0_USERNAME=admin \n  REOLINK_CAMERA_0_PASSWORD=secret",
+		UsageText:                 "reolinkproxy [options]\n\nCameras are managed entirely through the web UI (or by editing the config file directly) - see --web-address/--config-file below.",
 		Version:                   fmt.Sprintf("%s (commit: %s)", Version, Commit),
 		DisableSliceFlagSeparator: true,
 		Commands:                  []*cli.Command{newHealthcheckCommand()},
@@ -109,12 +109,12 @@ func main() {
 				Value:       cfg.Server.RTCPAddress,
 				Destination: &cfg.Server.RTCPAddress,
 			},
-			&cli.StringFlag{
-				Name:        "server-onvif-address",
-				Usage:       "onvif server listen address",
-				Sources:     envVars("SERVER_ONVIF_ADDRESS"),
-				Value:       cfg.Server.ONVIFAddress,
-				Destination: &cfg.Server.ONVIFAddress,
+			&cli.IntFlag{
+				Name:        "server-onvif-base-port",
+				Usage:       "first port used to auto-assign each camera's own ONVIF server (base port + camera index)",
+				Sources:     envVars("SERVER_ONVIF_BASE_PORT"),
+				Value:       cfg.Server.ONVIFBasePort,
+				Destination: &cfg.Server.ONVIFBasePort,
 			},
 			&cli.StringFlag{
 				Name:        "server-pprof-address",
@@ -143,13 +143,6 @@ func main() {
 				Sources:     envVars("SERVER_ADVERTISE_HOST"),
 				Value:       cfg.Server.AdvertiseHost,
 				Destination: &cfg.Server.AdvertiseHost,
-			},
-			&cli.StringFlag{
-				Name:        "server-protect-ip",
-				Usage:       "expected IP address of the NVR (e.g. UniFi Protect) for the web UI's connected/offline indicator",
-				Sources:     envVars("SERVER_PROTECT_IP"),
-				Value:       cfg.Server.ProtectServerIP,
-				Destination: &cfg.Server.ProtectServerIP,
 			},
 			&cli.StringFlag{
 				Name:        "server-log-level",
@@ -230,29 +223,30 @@ func main() {
 			},
 		},
 		Action: func(ctx context.Context, _ *cli.Command) error {
-			if err := log.Configure(cfg.Server.LogLevel); err != nil {
-				return err
-			}
-
-			envCameras, err := loadCamerasFromEnv()
-			if err != nil {
-				return fmt.Errorf("load cameras from environment: %w", err)
-			}
-
 			store, err := newConfigStore(cfg.Server.ConfigFile, *cfg)
 			if err != nil {
 				return fmt.Errorf("load config file: %w", err)
 			}
-			// The config file is authoritative for cameras once it has any. Env vars only
-			// bootstrap it on a first run where the file is still empty, so cameras
-			// added/edited/removed via the web UI always survive a restart.
-			if err := store.ReplaceCamerasIfEmpty(envCameras, cfg.Server.ONVIFBasePort); err != nil {
-				return fmt.Errorf("bootstrap cameras from environment: %w", err)
+
+			// The config file is authoritative for everything - cameras, mqtt, server,
+			// onvif - once it exists. Hand-editing config.yml (broker, onvif credentials,
+			// advertise host, ...) or adding/editing/removing cameras through the web UI
+			// takes effect on the next restart. CLI flags/env vars only seed a first-run
+			// file; ConfigFile/WebAddress are never persisted (see their yaml:"-" tags) and
+			// always come from CLI/env.
+			fileCfg := store.Config()
+			fileCfg.Server = mergeServerDefaults(fileCfg.Server, cfg.Server)
+			if fileCfg.MQTT.Topic == "" {
+				fileCfg.MQTT.Topic = cfg.MQTT.Topic
+			}
+			*cfg = fileCfg
+
+			if err := log.Configure(cfg.Server.LogLevel); err != nil {
+				return err
 			}
 
-			cfg.Cameras = store.Cameras()
 			if len(cfg.Cameras) == 0 {
-				return fmt.Errorf("no cameras defined - add one via the web UI at %s, edit %s directly, or set REOLINK_CAMERA_0_* environment variables", cfg.Server.WebAddress, cfg.Server.ConfigFile)
+				log.Printf("no cameras defined yet - add one via the web UI at %s (or edit %s directly)", cfg.Server.WebAddress, cfg.Server.ConfigFile)
 			}
 
 			return runApp(ctx, cfg, store)
@@ -682,6 +676,8 @@ func runStream(
 		pauseReason      string
 		lastPacketAt     time.Time
 		lastVideoAt      time.Time
+		lastStatsBytes   uint64
+		lastStatsAt      time.Time
 		frameCount       int
 		streamTimestamps timestampUnwrapper
 		videoRTP         rtpTimestampGuard
@@ -943,6 +939,17 @@ func runStream(
 			if !lastVideoAt.IsZero() {
 				lastVideoAge = now.Sub(lastVideoAt)
 			}
+
+			if !lastStatsAt.IsZero() {
+				elapsed := now.Sub(lastStatsAt).Seconds()
+				if elapsed > 0 {
+					deltaBytes := videoBytes - lastStatsBytes
+					meta.setBitrate(float64(deltaBytes*8) / elapsed / 1000)
+				}
+			}
+			lastStatsBytes = videoBytes
+			lastStatsAt = now
+
 			log.Debugf("stream %s stats info=%d video=%d audio=%d video_bytes=%d rtsp_ready=%t audio_ready=%t has_clients=%t last_packet_age=%v last_video_age=%v", meta.name, infoPackets, videoPackets, audioPackets, videoBytes, handler.ready(), audio.ready(), handler.hasClients(), lastPacketAge, lastVideoAge)
 
 		case <-controlTicker.C:

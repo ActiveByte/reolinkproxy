@@ -4,35 +4,26 @@ services:
     image: reolinkproxy:latest
     container_name: reolinkproxy
     restart: unless-stopped
-    # Uncomment the following line if you want WS-Discovery (multicast) to work reliably on your local network
-    # network_mode: host
-    ports:
-      - "8554:8554/tcp" # RTSP
-      - "8000:8000/udp" # RTP
-      - "8001:8001/udp" # RTCP
-      - "8002:8002/tcp" # ONVIF API
-      - "3702:3702/udp" # ONVIF WS-Discovery
+    # Host networking is recommended: WS-Discovery (multicast), Reolink UID discovery
+    # (UDP broadcast), and each camera's own auto-assigned ONVIF port (see
+    # SERVER_ONVIF_BASE_PORT below) all need it. Comment this out and use the "ports"
+    # block instead only if you can't use host networking.
+    network_mode: host
+    # ports:
+    #   - "8554:8554/tcp" # RTSP
+    #   - "8000:8000/udp" # RTP
+    #   - "8001:8001/udp" # RTCP
+    #   - "3702:3702/udp" # ONVIF WS-Discovery
+    #   - "8080:8080/tcp" # Web UI
+    #   - "8102-8110:8102-8110/tcp" # Per-camera ONVIF (base_port..base_port+N cameras-1; widen range for more cameras)
+    volumes:
+      # Persists cameras added/edited/removed through the web UI across container
+      # recreation. Add your camera(s) via the web UI at :8080 after the first start.
+      - ./config.yml:/config.yml
     environment:
-      # Connection settings (Use either HOST or UID)
-      - REOLINK_CAMERA_0_NAME=Camera01
-      - REOLINK_CAMERA_0_HOST=192.168.1.100
-      # - REOLINK_CAMERA_0_UID=9527000...
-      - REOLINK_CAMERA_0_USERNAME=admin
-      - REOLINK_CAMERA_0_PASSWORD=your_password
-      - REOLINK_CAMERA_0_STREAM=main
-      - REOLINK_CAMERA_0_CHANNEL=0
-      
-      # Optional: Override the host IP advertised in RTSP and ONVIF URLs (useful if running in docker without host networking)
-      # - REOLINK_SERVER_ADVERTISE_HOST=192.168.1.50
-      
-      # ONVIF authentication credentials (if left blank, ONVIF endpoints will be unauthenticated)
-      - REOLINK_ONVIF_USERNAME=admin
-      - REOLINK_ONVIF_PASSWORD=onvif_password
-      
-      # Optional: Override device metadata
-      # - DEVICE_NAME=Camera01
-      # - DEVICE_MANUFACTURER=Reolink
-      # - DEVICE_MODEL=Argus 3 Ultra
+      # advertise_host, onvif username/password, and everything else besides cameras live
+      # in config.yml (see the volume above) - edit that file directly, no env vars needed.
+      - REOLINK_CONFIG_FILE=/config.yml
     healthcheck:
       test: ["CMD", "/usr/local/bin/reolinkproxy", "healthcheck"]
       interval: 30s

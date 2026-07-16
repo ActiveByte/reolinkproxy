@@ -1,5 +1,5 @@
 mqtt:
-  broker: "" # "tcp://192.168.1.50:1883"
+  broker: "tcp://10.0.0.21:1883"
   username: ""
   password: ""
   topic: "reolinkproxy"
@@ -8,35 +8,13 @@ server:
   rtsp_address: ":8554"
   rtp_address: ":8000"
   rtcp_address: ":8001"
-  onvif_address: ":8002"
+  # First port used to auto-assign each camera's own ONVIF server (base port + camera
+  # index) - camera 0 gets 8102, camera 1 gets 8103, etc., unless a camera sets onvif_port
+  # explicitly below.
+  onvif_base_port: 8102
   advertise_host: "" # Optional: specify host IP to advertise in ONVIF/RTSP
   log_packets: false
 
 onvif:
   username: "admin"
-  password: ""
-
-cameras:
-  - name: "Camera01"
-    host: "192.168.1.100"
-    port: 9000
-    # uid: "9527000000000000"
-    username: "admin"
-    password: "secret_password"
-    timeout: 10s
-    stream: "main,sub"
-    # Optional mid-tier ext stream (Reolink channel0_ext.bcs; higher res than sub on some doorbells):
-    # stream: "main,sub,extern"
-    # talk_profile: sub
-    channel: 0
-    rtsp_path: "Camera01/stream"
-    # With stream=main,sub: Camera01/stream_main, Camera01/stream_sub
-    # With stream=main,sub,extern: also Camera01/stream_extern
-    # talk_profile selects which profile gets the clean Camera01/stream alias
-
-# - name: "Camera02"
-#   host: "192.168.1.101"
-#   username: "admin"
-#   password: "secret_password"
-#   stream: "main"
-#   channel: 0
+  password: "admin"

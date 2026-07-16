@@ -99,6 +99,13 @@ type eventsBroker struct {
 
 	recentMu sync.Mutex
 	recent   []loggedEvent
+
+	countMu    sync.Mutex
+	eventTimes []time.Time // rolling log of every broadcast, pruned to the last 24h on read
+
+	forwarderMu    sync.Mutex
+	forwarderUp    bool
+	forwarderSince time.Time
 }
 
 func newEventsBroker(cameraName string) *eventsBroker {
@@ -109,6 +116,45 @@ func newEventsBroker(cameraName string) *eventsBroker {
 	}
 	go b.reapLoop()
 	return b
+}
+
+// SetForwarderSubscribed records whether runCameraEventForwarder currently has a live
+// PullPoint subscription against the camera's own ONVIF events service - i.e. whether we're
+// actually able to receive real motion/smart-detection events from it right now, as opposed
+// to just having downstream NVR subscribers.
+func (b *eventsBroker) SetForwarderSubscribed(up bool) {
+	b.forwarderMu.Lock()
+	defer b.forwarderMu.Unlock()
+	if b.forwarderUp == up {
+		return
+	}
+	b.forwarderUp = up
+	b.forwarderSince = time.Now()
+}
+
+// ForwarderStatus reports whether we're currently subscribed to the camera's own ONVIF
+// events service, and since when.
+func (b *eventsBroker) ForwarderStatus() (bool, time.Time) {
+	b.forwarderMu.Lock()
+	defer b.forwarderMu.Unlock()
+	return b.forwarderUp, b.forwarderSince
+}
+
+// Count24h returns how many events (real + test) this camera has broadcast in the last 24
+// hours - unlike RecentEvents, which is capped at maxRecentEvents, this stays accurate
+// regardless of volume.
+func (b *eventsBroker) Count24h() int {
+	cutoff := time.Now().Add(-24 * time.Hour)
+	b.countMu.Lock()
+	defer b.countMu.Unlock()
+	i := 0
+	for i < len(b.eventTimes) && b.eventTimes[i].Before(cutoff) {
+		i++
+	}
+	if i > 0 {
+		b.eventTimes = b.eventTimes[i:]
+	}
+	return len(b.eventTimes)
 }
 
 const (
@@ -150,11 +196,15 @@ func lastKnownKey(topic, itemName string) string {
 
 func (b *eventsBroker) record(source string, ev onvifEventMsg) {
 	b.recentMu.Lock()
-	defer b.recentMu.Unlock()
 	b.recent = append(b.recent, loggedEvent{Source: source, Topic: ev.Topic, ItemName: ev.ItemName, ItemValue: ev.ItemValue, Time: ev.UTCTime})
 	if len(b.recent) > maxRecentEvents {
 		b.recent = b.recent[len(b.recent)-maxRecentEvents:]
 	}
+	b.recentMu.Unlock()
+
+	b.countMu.Lock()
+	b.eventTimes = append(b.eventTimes, time.Now())
+	b.countMu.Unlock()
 }
 
 // RecentEvents returns the most recent events (oldest first) for the web UI's live log.

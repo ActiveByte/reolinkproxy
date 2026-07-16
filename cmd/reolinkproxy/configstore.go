@@ -23,7 +23,7 @@ type ConfigStore struct {
 // CLI-flag/env-resolved config) so a first-run file reflects real effective settings
 // instead of blank ones, and so persisting a later camera-only edit doesn't clobber
 // mqtt/server/onvif sections back to zero values. defaults.Cameras is ignored; cameras are
-// only ever set through ReplaceCamerasIfEmpty/AddCamera/UpdateCamera/RemoveCamera.
+// only ever set through AddCamera/UpdateCamera/RemoveCamera (the web UI).
 func newConfigStore(path string, defaults Config) (*ConfigStore, error) {
 	s := &ConfigStore{path: path}
 
@@ -64,24 +64,15 @@ func (s *ConfigStore) Cameras() []CameraConfig {
 	return append([]CameraConfig(nil), s.cfg.Cameras...)
 }
 
-// ReplaceCamerasIfEmpty seeds the store from cams (e.g. REOLINK_CAMERA_* env vars) only if
-// the file doesn't already define any cameras, so the file - once populated - always wins
-// on subsequent runs and env vars behave as a first-run bootstrap only.
-func (s *ConfigStore) ReplaceCamerasIfEmpty(cams []CameraConfig, onvifBasePort int) error {
+// Config returns a copy of the full loaded config (mqtt/server/onvif/cameras) as read from
+// the config file, so the caller can adopt it as the app's authoritative runtime config -
+// same precedence as Cameras: the file wins once it exists, CLI/env only seed it.
+func (s *ConfigStore) Config() Config {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if len(s.cfg.Cameras) > 0 || len(cams) == 0 {
-		return nil
-	}
-
-	for i := range cams {
-		applyCameraDefaults(&cams[i], i, onvifBasePort)
-		if err := validateCameraConfig(&cams[i]); err != nil {
-			return fmt.Errorf("camera %d: %w", i, err)
-		}
-	}
-	s.cfg.Cameras = cams
-	return s.persistLocked()
+	cfg := s.cfg
+	cfg.Cameras = append([]CameraConfig(nil), s.cfg.Cameras...)
+	return cfg
 }
 
 // AddCamera validates, defaults, appends, and persists a new camera.
@@ -150,24 +141,6 @@ func (s *ConfigStore) UpdateCamera(name string, updated CameraConfig, onvifBaseP
 		return CameraConfig{}, err
 	}
 	return updated, nil
-}
-
-// ProtectServerIP returns the currently configured expected NVR IP address.
-func (s *ConfigStore) ProtectServerIP() string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.cfg.Server.ProtectServerIP
-}
-
-// SetProtectServerIP updates and persists the expected NVR IP address used by the web UI's
-// connected/offline indicator. Unlike camera edits this takes effect immediately - it's
-// purely informational (no ONVIF/RTSP negotiation depends on it) so it doesn't require a
-// restart.
-func (s *ConfigStore) SetProtectServerIP(ip string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.cfg.Server.ProtectServerIP = ip
-	return s.persistLocked()
 }
 
 // RemoveCamera deletes the named camera and persists the change.

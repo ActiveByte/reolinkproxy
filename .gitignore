@@ -38,3 +38,6 @@ junit.xml
 
 # Claude Code local settings
 .claude/
+config.yml
+notes.txt
+proxy*
