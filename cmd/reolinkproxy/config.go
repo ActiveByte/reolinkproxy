@@ -244,7 +244,9 @@ func cameraEnvFieldIndexes() map[string]int {
 
 	for i := range cameraConfigType.NumField() {
 		tag := strings.Split(cameraConfigType.Field(i).Tag.Get("yaml"), ",")[0]
-		if tag == "" || tag == "-" {
+		// stream is not user-configurable (see applyCameraDefaults); skip it so
+		// REOLINK_CAMERA_<n>_STREAM is silently ignored rather than accepted and discarded.
+		if tag == "" || tag == "-" || tag == "stream" {
 			continue
 		}
 		out[strings.ToUpper(tag)] = i
@@ -289,9 +291,10 @@ func applyCameraDefaults(camera *CameraConfig, index int, onvifBasePort int) {
 	if camera.Port == 0 {
 		camera.Port = 9000
 	}
-	if camera.Stream == "" {
-		camera.Stream = "main,sub"
-	}
+	// Stream is not user-configurable: it's always main+sub. A wrong value here would
+	// silently drop a stream tier, so this ignores whatever is in the env/file and forces
+	// the same two profiles on every load. Use SubUsesExtern to swap what "sub" pulls.
+	camera.Stream = "main,sub"
 	if camera.RTSPPath == "" {
 		camera.RTSPPath = camera.Name + "/stream"
 	}

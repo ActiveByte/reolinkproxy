@@ -1,7 +1,9 @@
 package main
 
 import (
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -130,6 +132,35 @@ func TestConfigStoreSeedsNonCameraSectionsOnFirstCreateAndPreservesThemOnEdit(t 
 	}
 	if reloaded.cfg.ONVIF.Password != "hunter2" {
 		t.Fatalf("expected onvif password to survive a camera edit, got %q", reloaded.cfg.ONVIF.Password)
+	}
+}
+
+func TestConfigStoreHealsLegacyStreamValueOnLoad(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "config.yml")
+	legacy := "cameras:\n  - name: front\n    host: 192.168.1.10\n    stream: main\n    onvif_port: 8102\n"
+	if err := os.WriteFile(path, []byte(legacy), 0o600); err != nil {
+		t.Fatalf("write legacy config: %v", err)
+	}
+
+	store, err := newConfigStore(path, Config{})
+	if err != nil {
+		t.Fatalf("newConfigStore: %v", err)
+	}
+	cams := store.Cameras()
+	if len(cams) != 1 || cams[0].Stream != "main,sub" {
+		t.Fatalf("expected legacy stream value to heal to main,sub, got %+v", cams)
+	}
+
+	// The fix must be persisted, not just held in memory, so a stale file doesn't keep
+	// reverting on every restart.
+	onDisk, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read config file: %v", err)
+	}
+	if !strings.Contains(string(onDisk), "stream: main,sub") {
+		t.Fatalf("expected healed stream value to be persisted to disk, got:\n%s", onDisk)
 	}
 }
 

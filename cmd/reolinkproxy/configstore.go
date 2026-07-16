@@ -45,6 +45,15 @@ func newConfigStore(path string, defaults Config) (*ConfigStore, error) {
 		return nil, fmt.Errorf("parse config file %s: %w", path, err)
 	}
 	s.cfg = fileCfg
+	// Re-apply defaults to cameras already on disk so fields that predate a later default
+	// change (e.g. Stream, forced to main,sub regardless of what's stored) self-heal on
+	// restart instead of staying stuck at whatever an older version of the app wrote.
+	for i := range s.cfg.Cameras {
+		applyCameraDefaults(&s.cfg.Cameras[i], i, defaults.Server.ONVIFBasePort)
+	}
+	if err := s.persistLocked(); err != nil {
+		return nil, err
+	}
 	return s, nil
 }
 
