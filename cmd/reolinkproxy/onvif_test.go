@@ -136,9 +136,18 @@ func TestSOAPAction(t *testing.T) {
 			body:     `<tds:UnknownAction />`,
 			expected: "",
 		},
+		{
+			// A real gSOAP-generated ONVIF client (a UniFi Protect ONVIF event listener
+			// tool) sends SOAPAction headers using the WSDL input-message name
+			// (operation + "Request"), which must be normalized back to the bare
+			// operation name or every call from it looks like an unknown action.
+			name:     "From Header With Request Suffix",
+			header:   `http://www.onvif.org/ver10/events/wsdl/CreatePullPointSubscriptionRequest`,
+			expected: "CreatePullPointSubscription",
+		},
 	}
 
-	knownActions := []string{"GetDeviceInformation", "GetSystemDateAndTime"}
+	knownActions := []string{"GetDeviceInformation", "GetSystemDateAndTime", "CreatePullPointSubscription"}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
