@@ -24,10 +24,9 @@ services:
       # through the web UI across container recreation - add your camera(s) via the web
       # UI at :8080 after the first start.
       - ./data:/data
-    environment:
-      # advertise_host, onvif username/password, and everything else besides cameras live
-      # in config.yml (see the volume above) - edit that file directly, no env vars needed.
-      - REOLINK_CONFIG_FILE=/data/config.yml
+    # advertise_host, onvif username/password, and everything else besides cameras live in
+    # /data/config.yml (see the volume above, defaulted via REOLINK_CONFIG_FILE in the
+    # image) - edit that file directly, no env vars needed.
     healthcheck:
       test: ["CMD", "/usr/local/bin/reolinkproxy", "healthcheck"]
       interval: 30s

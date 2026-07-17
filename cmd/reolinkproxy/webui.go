@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -28,10 +29,11 @@ type cameraStatus struct {
 	// connect to - the proxy's own advertised address, not the camera's LAN IP.
 	ONVIFAuthority string
 
-	device *CameraDevice
-	metas  []*streamMetadata
-	motion *cameraMotionState
-	events *eventsBroker
+	device   *CameraDevice
+	metas    []*streamMetadata
+	motion   *cameraMotionState
+	events   *eventsBroker
+	snapshot *cameraONVIFClient
 }
 
 type statusRegistry struct {
@@ -193,6 +195,16 @@ func (r *statusRegistry) getEvents(name string) *eventsBroker {
 	return cs.events
 }
 
+func (r *statusRegistry) getSnapshotClient(name string) *cameraONVIFClient {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	cs := r.byName[name]
+	if cs == nil {
+		return nil
+	}
+	return cs.snapshot
+}
+
 // webUIServer serves the status/config dashboard and its JSON API. Camera mutations are
 // persisted to the config file immediately but only take effect for the running Baichuan/
 // RTSP/ONVIF sessions after a process restart - tearing those down and rebuilding them live
@@ -221,6 +233,7 @@ func newWebUIHandler(store *ConfigStore, status *statusRegistry, onvifBasePort i
 	mux.HandleFunc("PUT /api/cameras/{name}", h.handleUpdateCamera)
 	mux.HandleFunc("DELETE /api/cameras/{name}", h.handleDeleteCamera)
 	mux.HandleFunc("GET /api/cameras/{name}/events", h.handleCameraEvents)
+	mux.HandleFunc("GET /api/cameras/{name}/snapshot", h.handleCameraSnapshot)
 	mux.HandleFunc("POST /api/cameras/{name}/test-event", h.handleTestEvent)
 	mux.HandleFunc("POST /api/restart", h.handleRestart)
 	return mux
@@ -237,6 +250,33 @@ func (h *webUIServer) handleCameraEvents(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	writeJSON(w, http.StatusOK, broker.RecentEvents())
+}
+
+// handleCameraSnapshot proxies a live thumbnail from the camera's own ONVIF snapshot
+// endpoint for display in the web UI, reusing the same client the camera's per-camera
+// ONVIF service uses for its own /api/snapshot/ proxy (see onvif.go's handleSnapshot).
+func (h *webUIServer) handleCameraSnapshot(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	client := h.status.getSnapshotClient(name)
+	if client == nil {
+		http.Error(w, "no snapshot source configured for this camera", http.StatusNotFound)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
+	defer cancel()
+
+	data, contentType, err := client.Snapshot(ctx)
+	if err != nil {
+		log.Warnf("web ui snapshot: fetch failed for camera=%s: %v", name, err)
+		http.Error(w, "failed to fetch snapshot from camera", http.StatusBadGateway)
+		return
+	}
+
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(data)
 }
 
 type testEventRequest struct {
@@ -473,14 +513,17 @@ const indexHTML = `<!doctype html>
   table { width: 100%; border-collapse: collapse; }
   th, td { text-align: left; padding: 0.45rem 0.6rem; border-bottom: 1px solid var(--border); vertical-align: top; overflow-wrap: break-word; }
   #cameraTable { table-layout: fixed; }
-  #cameraTable th:nth-child(1), #cameraTable td:nth-child(1) { width: 8%; }
-  #cameraTable th:nth-child(2), #cameraTable td:nth-child(2) { width: 11%; }
-  #cameraTable th:nth-child(3), #cameraTable td:nth-child(3) { width: 13%; }
-  #cameraTable th:nth-child(4), #cameraTable td:nth-child(4) { width: 18%; }
-  #cameraTable th:nth-child(5), #cameraTable td:nth-child(5) { width: 17%; }
-  #cameraTable th:nth-child(6), #cameraTable td:nth-child(6) { width: 17%; }
-  #cameraTable th:nth-child(7), #cameraTable td:nth-child(7) { width: 6%; }
-  #cameraTable th:nth-child(8), #cameraTable td:nth-child(8) { width: 10%; }
+  #cameraTable th:nth-child(1), #cameraTable td:nth-child(1) { width: 6%; }
+  #cameraTable th:nth-child(2), #cameraTable td:nth-child(2) { width: 9%; }
+  #cameraTable th:nth-child(3), #cameraTable td:nth-child(3) { width: 10%; }
+  #cameraTable th:nth-child(4), #cameraTable td:nth-child(4) { width: 11%; }
+  #cameraTable th:nth-child(5), #cameraTable td:nth-child(5) { width: 16%; }
+  #cameraTable th:nth-child(6), #cameraTable td:nth-child(6) { width: 15%; }
+  #cameraTable th:nth-child(7), #cameraTable td:nth-child(7) { width: 15%; }
+  #cameraTable th:nth-child(8), #cameraTable td:nth-child(8) { width: 6%; }
+  #cameraTable th:nth-child(9), #cameraTable td:nth-child(9) { width: 12%; }
+  .thumb { width: 72px; height: 40px; object-fit: cover; border-radius: 4px; background: var(--bg); border: 1px solid var(--border); display: block; }
+  .thumb.thumb-error { background: color-mix(in srgb, var(--down) 8%, var(--bg)); }
   th { font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.03em; color: var(--muted); font-weight: 600; }
   tbody tr:hover { background: color-mix(in srgb, var(--accent) 5%, transparent); }
   .mono { font-family: var(--mono); font-size: 0.82em; }
@@ -558,7 +601,7 @@ const indexHTML = `<!doctype html>
 <div class="panel">
 <table id="cameraTable">
   <thead>
-    <tr><th>Status</th><th>Camera</th><th>ONVIF</th><th>Streams</th><th>RTSP clients</th><th>Event subscribers</th><th>Motion</th><th>Actions</th></tr>
+    <tr><th>Status</th><th>Snapshot</th><th>Camera</th><th>ONVIF</th><th>Streams</th><th>RTSP clients</th><th>Event subscribers</th><th>Motion</th><th>Actions</th></tr>
   </thead>
   <tbody id="cameraRows"></tbody>
 </table>
@@ -726,15 +769,23 @@ function statusCell(view) {
   return '<span class="dot ' + dotClass(view) + '" title="' + title + '"></span>' + reconnects;
 }
 
+// thumbBucket changes only once every 10s, so rows rebuilt by the 3s status poll (see
+// refresh() below) reuse the same snapshot URL in between and the browser serves it from
+// its own cache instead of re-fetching from the camera on every poll tick.
+function thumbBucket() { return Math.floor(Date.now() / 10000); }
+
 function render(statusList, cameraList) {
   var byName = {};
   cameraList.forEach(function(c) { byName[c.name] = c; });
+  var bucket = thumbBucket();
 
   var rows = statusList.map(function(view) {
     var streams = (view.streams || []).map(fmtStream).join('<br>') || '<span class="muted">no stream yet</span>';
     var onvif = '<span class="mono">' + view.onvif_authority + '</span><br><span class="muted mono">mac ' + view.onvif_mac + '</span>';
+    var snapshotUrl = '/api/cameras/' + encodeURIComponent(view.name) + '/snapshot?t=' + bucket;
     return '<tr>' +
       '<td>' + statusCell(view) + '</td>' +
+      '<td><img class="thumb" src="' + snapshotUrl + '" alt="" loading="lazy" onerror="this.removeAttribute(\'src\');this.classList.add(\'thumb-error\')"></td>' +
       '<td><strong>' + view.name + '</strong><br><span class="muted mono">' + view.host + '</span></td>' +
       '<td>' + onvif + '</td>' +
       '<td>' + streams + '</td>' +
@@ -749,7 +800,7 @@ function render(statusList, cameraList) {
     '</tr>';
   });
 
-  document.getElementById('cameraRows').innerHTML = rows.join('') || '<tr><td colspan="8" class="muted">No cameras configured yet.</td></tr>';
+  document.getElementById('cameraRows').innerHTML = rows.join('') || '<tr><td colspan="9" class="muted">No cameras configured yet.</td></tr>';
 
   document.querySelectorAll('[data-edit]').forEach(function(btn) {
     btn.addEventListener('click', function() { openForm(byName[btn.getAttribute('data-edit')]); });

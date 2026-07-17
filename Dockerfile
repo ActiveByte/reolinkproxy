@@ -30,6 +30,13 @@ RUN useradd --system --uid 65532 --home-dir /nonexistent --shell /usr/sbin/nolog
 
 COPY --from=build /out/reolinkproxy /usr/local/bin/reolinkproxy
 
+# /data holds config.yml, persisted via a volume. Pre-created and owned by the runtime
+# user here so a named volume (which inherits an image directory's ownership on first
+# mount) works out of the box; a host bind mount still needs to be chowned to 65532:65532
+# manually since it replaces this directory's ownership with the host path's own.
+RUN mkdir -p /data && chown 65532:65532 /data
+ENV REOLINK_CONFIG_FILE=/data/config.yml
+
 USER 65532:65532
 
 EXPOSE 8554/tcp
