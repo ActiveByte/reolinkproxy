@@ -17,13 +17,17 @@ services:
     #   - "8080:8080/tcp" # Web UI
     #   - "8102-8110:8102-8110/tcp" # Per-camera ONVIF (base_port..base_port+N cameras-1; widen range for more cameras)
     volumes:
-      # Persists cameras added/edited/removed through the web UI across container
-      # recreation. Add your camera(s) via the web UI at :8080 after the first start.
-      - ./config.yml:/config.yml
+      # Mount a directory, not the file directly: the container runs as non-root (uid
+      # 65532) and writes config.yml atomically via a temp file in the same directory, so
+      # that directory must be writable by uid 65532 (e.g. `chown -R 65532:65532 ./data`
+      # on the host once before first start). Persists cameras added/edited/removed
+      # through the web UI across container recreation - add your camera(s) via the web
+      # UI at :8080 after the first start.
+      - ./data:/data
     environment:
       # advertise_host, onvif username/password, and everything else besides cameras live
       # in config.yml (see the volume above) - edit that file directly, no env vars needed.
-      - REOLINK_CONFIG_FILE=/config.yml
+      - REOLINK_CONFIG_FILE=/data/config.yml
     healthcheck:
       test: ["CMD", "/usr/local/bin/reolinkproxy", "healthcheck"]
       interval: 30s
